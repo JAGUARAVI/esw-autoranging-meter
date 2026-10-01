@@ -161,6 +161,7 @@ typedef struct {
     double c_eq_f;        // raw series-equivalent seen by the circuit (pre-correction)
     double quality;     // 0..1, physics-based confidence
     double tau_us;      // ADC: measured τ.   OSC: measured full period.
+    double fit_r2;      // ADC: R² of the exponential fit (1 = perfect)
     double freq_hz;     // OSC only
     bool suspicious;    // timing/health looks wrong (down-weighted, still usable)
 } sample_t;
@@ -571,10 +572,17 @@ static void log_sample(const char *phase, const sample_t *s)
         }
     } else {
         if (s->valid) {
-            ESP_LOGI(TAG,
-                     "  [%s] ADC %6s | tau %8.1f us | C %10s | q %.3f | Vinf %4d mV | %s",
-                     phase, range, s->tau_us, cap, s->quality,
-                     g_v_inf_cache[s->range_idx], verdict);
+            if (s->fit_r2 >= 0.0) {
+                ESP_LOGI(TAG,
+                         "  [%s] ADC %6s | tau %8.1f us | C %10s | q %.3f | Vinf %4d mV | R2 %.3f | %s",
+                         phase, range, s->tau_us, cap, s->quality,
+                         g_v_inf_cache[s->range_idx], s->fit_r2, verdict);
+            } else {
+                ESP_LOGI(TAG,
+                         "  [%s] ADC %6s | tau %8.1f us | C %10s | q %.3f | Vinf %4d mV | 2pt | %s",
+                         phase, range, s->tau_us, cap, s->quality,
+                         g_v_inf_cache[s->range_idx], verdict);
+            }
         } else {
             ESP_LOGW(TAG, "  [%s] ADC %6s | no threshold crossing (too slow) | %s",
                      phase, range, verdict);
@@ -584,6 +592,72 @@ static void log_sample(const char *phase, const sample_t *s)
 
 // Per-range measured asymptote cache (mV).  0 = not yet measured.
 int g_v_inf_cache[RANGE_COUNT] = {0, 0, 0, 0};
+
+// --- Least-squares exponential fit of the RC charge curve -----------------
+// The charge follows V(t) = V_inf·(1 − e^(−t/τ)), so
+//      ln(V_inf − V) = ln(V_inf) − t/τ
+// is a straight line in t with slope −1/τ.  We fit that line over all sampled
+// points; the slope gives τ and R² tells us how exponential the curve really
+// is (leakage, ESR, or dielectric absorption bend the curve → lower R²).
+#define RC_FIT_MAX_PTS 48
+
+typedef struct {
+    bool ok;
+    double tau_us;   // fitted time constant
+    double r2;       // coefficient of determination (1 = perfect exponential)
+    int n;           // points used
+} rc_fit_t;
+
+// ts[] = time in us, mv[] = calibrated millivolts, n = count, v_inf = asymptote.
+static rc_fit_t rc_exp_fit(const int64_t *ts, const int *mv, int n, int v_inf)
+{
+    rc_fit_t r = {.ok = false, .tau_us = 0.0, .r2 = 0.0, .n = 0};
+    if (n < 6 || v_inf <= 0) return r;
+
+    // Build y = ln(V_inf - V) and drop points too close to the asymptote where
+    // (V_inf - V) approaches the ADC noise floor and the log blows up.
+    // Working arrays live in static storage (single measurement task => safe)
+    // to keep them off the main task's limited stack.
+    static double xs[RC_FIT_MAX_PTS], ys[RC_FIT_MAX_PTS];
+    double sx = 0, sy = 0, sxx = 0, sxy = 0;
+    int m = 0;
+    for (int i = 0; i < n; ++i) {
+        double gap = (double)v_inf - (double)mv[i];
+        if (gap < 12.0) continue;              // too close to asymptote / noise
+        double x = (double)(ts[i] - ts[0]);     // us, relative to first sample
+        double y = log(gap);
+        xs[m] = x; ys[m] = y;
+        sx += x; sy += y; sxx += x * x; sxy += x * y;
+        m++;
+        if (m >= RC_FIT_MAX_PTS) break;
+    }
+    if (m < 6) return r;
+
+    double denom = (double)m * sxx - sx * sx;
+    if (fabs(denom) < 1e-9) return r;
+    double slope = ((double)m * sxy - sx * sy) / denom;   // = -1/τ (per us)
+    if (slope >= -1e-9) return r;                          // not decaying → bad
+    double tau_us = -1.0 / slope;
+
+    // R² of the linear fit in log space.
+    double ybar = sy / (double)m;
+    double ss_res = 0, ss_tot = 0;
+    double intercept = (sy - slope * sx) / (double)m;
+    for (int i = 0; i < m; ++i) {
+        double yhat = slope * xs[i] + intercept;
+        double dres = ys[i] - yhat;
+        double dtot = ys[i] - ybar;
+        ss_res += dres * dres;
+        ss_tot += dtot * dtot;
+    }
+    double r2 = (ss_tot > 1e-12) ? (1.0 - ss_res / ss_tot) : 0.0;
+
+    r.ok = true;
+    r.tau_us = tau_us;
+    r.r2 = r2;
+    r.n = m;
+    return r;
+}
 
 // Measure (or recall) the true charge asymptote V_inf for a range.  The node
 // asymptotes below 3.3 V when a parasitic pull-down (R_bias / leakage) forms a
@@ -668,12 +742,21 @@ static sample_t measure_adc_range(uint8_t range_idx)
         return s;
     }
 
-    // ---- Phase B: timed charge, thresholds referenced to the MEASURED V_inf ----
-    // Crossing levels: start ~10 % and τ at 63.2 % of V_inf (absolute floor
-    // keeps the start above the noise floor even on a droopy range).
+    // ---- Phase B: capture the charge curve, then least-squares fit τ ----
+    // We sample the node from just above the start floor up to ~70 % of V_inf
+    // (past the 63.2 % τ point), then fit ln(V_inf - V) vs t.  The slope is
+    // -1/τ; the R² of the fit is a direct quality/leakage metric.  If the fit
+    // is unusable we fall back to the classic two-threshold crossing time.
     int v_low = v_start + (int)(0.10 * (double)(v_inf - v_start));
     if (v_low < v_start + 40) v_low = v_start + 40;
     int v_tau = v_start + (int)(V_TAU_FRAC * (double)(v_inf - v_start));
+    int v_stop = v_start + (int)(0.72 * (double)(v_inf - v_start)); // capture past τ
+
+    // Sample buffers in static storage (single measurement task => safe) to
+    // avoid overflowing the main task stack (the default is only ~3.5 KB).
+    static int64_t ts[RC_FIT_MAX_PTS];
+    static int     mvs[RC_FIT_MAX_PTS];
+    int     npts = 0;
 
     int64_t t_begin = esp_timer_get_time();
     gpio_set_level(DRIVE_PIN, 1);
@@ -695,33 +778,21 @@ static sample_t measure_adc_range(uint8_t range_idx)
         }
 
         if (t_start < 0 && mv >= v_low) t_start = now;
-        if (mv >= v_tau) {
-            t_tau = now;
-            break;
+        if (t_tau < 0 && mv >= v_tau) t_tau = now;
+
+        // record points once we are past the start floor
+        if (t_start >= 0 && mv >= v_low && npts < RC_FIT_MAX_PTS) {
+            ts[npts] = now;
+            mvs[npts] = mv;
+            npts++;
         }
+
+        if (mv >= v_stop) break;                 // captured past τ
         if ((now - t_begin) > timeout_us) break; // too large for this range
     }
     gpio_set_level(DRIVE_PIN, 0);
 
-    if (t_start < 0 || t_tau <= t_start) { // timed out or degenerate
-        log_sample(g_phase, &s);
-        return s;
-    }
-
-    double tau_us = (double)(t_tau - t_start);
-    s.valid = true;
-    s.tau_us = tau_us;
-
-    // The charge follows  V(t) = V_inf(1 - e^-t/τ_eff),  where the effective
-    // time constant τ_eff = (R_range ∥ R_leak)·C_eq.  The measured interval
-    // spans v_low → v_tau, so  dt = τ_eff · ln((V_inf - v_low)/(V_inf - v_tau)).
-    double denom = (double)(v_inf - v_tau);
-    if (denom < 1.0) denom = 1.0;
-    double k_corr = log(((double)(v_inf - v_low)) / denom);
-    if (k_corr < 0.05) k_corr = 0.05; // numerical floor
-
-    // τ_eff uses the PARALLEL combination of the range resistor and the leak,
-    // so recover C_eq with the same parallel R.  Estimate R_leak from V_inf.
+    // Effective parallel resistance from the measured asymptote (divider droop).
     double r_range = RANGES[range_idx].resistance_ohms;
     double r_leak = ((double)v_inf * r_range) / ((double)V_NOMINAL_MV - (double)v_inf + 1e-9);
     double r_eff = r_range;
@@ -729,7 +800,42 @@ static sample_t measure_adc_range(uint8_t range_idx)
         r_eff = (r_range * r_leak) / (r_range + r_leak); // parallel
     }
 
-    double c_eq = (tau_us * 1e-6) / (r_eff * k_corr);
+    double tau_us = -1.0;
+    double fit_r2 = 0.0;
+    bool used_fit = false;
+    double fallback_k_corr = 1.0;   // log factor for the 2-point fallback
+
+    // Primary: least-squares exponential fit over the captured curve.
+    rc_fit_t fit = rc_exp_fit(ts, mvs, npts, v_inf);
+    if (fit.ok && fit.r2 > 0.90 && fit.tau_us > 0.0) {
+        tau_us = fit.tau_us;
+        fit_r2 = fit.r2;
+        used_fit = true;
+    } else if (t_start >= 0 && t_tau > t_start) {
+        // Fallback: two-threshold crossing time with the exact log correction.
+        double denom = (double)(v_inf - v_tau);
+        if (denom < 1.0) denom = 1.0;
+        fallback_k_corr = log(((double)(v_inf - v_low)) / denom);
+        if (fallback_k_corr < 0.05) fallback_k_corr = 0.05;
+        tau_us = (double)(t_tau - t_start);   // raw crossing interval
+        fit_r2 = -1.0;                        // marks "fallback" in the log
+    } else {
+        log_sample(g_phase, &s);
+        return s; // never crossed: too large for this range
+    }
+
+    s.valid = true;
+    s.tau_us = tau_us;
+    s.fit_r2 = fit_r2;
+
+    // Recover C_eq.  Fitted path: τ_eff = r_eff · C_eq.  Fallback path: the
+    // crossing interval must be divided by the log factor to recover τ_eff.
+    double c_eq;
+    if (used_fit) {
+        c_eq = (tau_us * 1e-6) / r_eff;
+    } else {
+        c_eq = (tau_us * 1e-6) / (r_eff * fallback_k_corr);
+    }
     s.c_eq_f = c_eq;
 
     // Correct order: invert the C_block series combination FIRST, THEN subtract
@@ -766,9 +872,19 @@ static sample_t measure_adc_range(uint8_t range_idx)
     }
     double q_stray = c / (c + 3.0 * STRAY_CAPACITANCE_F);
     double q_range = (range_idx <= 1) ? 0.85 : 1.0; // low-R ranges: leakage hurts
-    double q = q_time * q_stray * q_range;
-    // A *clean* (plausible, jitter-free) ADC tau is a real measurement even at
-    // the bottom of the window; keep a floor so it is not crushed to ~0.
+
+    // Goodness-of-fit: a high R² means the curve is a clean exponential (low
+    // leakage / low ESR).  A fitted sample with R² >= 0.99 gets full credit;
+    // the 2-point fallback (fit_r2 == -1) is inherently less trustworthy, and a
+    // fitted-but-poor curve (leaky / non-exponential) is down-weighted hard.
+    double q_fit;
+    if (s.fit_r2 < 0.0)      q_fit = 0.6;                        // 2-point fallback
+    else if (s.fit_r2 >= 0.99) q_fit = 1.0;                      // clean exponential
+    else                       q_fit = 0.4 + 0.6 * s.fit_r2;     // scale by R²
+
+    double q = q_time * q_stray * q_range * q_fit;
+    // A *clean* (plausible, well-fit) ADC tau is a real measurement even at the
+    // bottom of the window; keep a floor so it is not crushed to ~0.
     if (q < 0.15) q = 0.15;
     s.quality = q;
 
@@ -978,7 +1094,7 @@ static int cmp_double(const void *a, const void *b)
 static double median_of(const double *v, int n)
 {
     if (n <= 0) return NAN;
-    double buf[MAX_SAMPLES];
+    static double buf[MAX_SAMPLES];   // static: single measurement task
     for (int i = 0; i < n; ++i) buf[i] = v[i];
     qsort(buf, (size_t)n, sizeof(double), cmp_double);
     if (n & 1) return buf[n / 2];
@@ -997,9 +1113,9 @@ static fusion_t fuse_samples(const sample_t *samples, int n)
         .raw_samples = n,
     };
 
-    double cvals[MAX_SAMPLES];
-    double weights[MAX_SAMPLES];
-    int kept_method[MAX_SAMPLES];
+    static double cvals[MAX_SAMPLES];   // static: keep off the main stack
+    static double weights[MAX_SAMPLES];
+    static int kept_method[MAX_SAMPLES];
     int n_kept = 0;
 
     for (int i = 0; i < n; ++i) {
@@ -1078,7 +1194,7 @@ static fusion_t measure_capacitance_autoranged(void)
 {
     static uint8_t preferred_range = 2; // remembered between cycles (100 kΩ)
 
-    sample_t samples[MAX_SAMPLES];
+    static sample_t samples[MAX_SAMPLES];   // static: keep off the main stack
     int n = 0;
 
     // ---- Phase 1: probe with the oscillator for a rough estimate ----
