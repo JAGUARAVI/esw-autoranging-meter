@@ -32,9 +32,33 @@ The system now supports a hybrid measurement approach, automatically routing bas
 | **Range Mux A1** | MAX4619 | `GPIO5` | Output |
 | **Ground Return** | $V_{bias}$ Return | `GPIO3` | Output (Strictly LOW) |
 
-## 4. Pending Action Items & Validation Required
+## 4. Sub-nF / Parasitic-Capacitance Calibration
 
-* **Tune Oscillator K-Factor:** The current `OSC_K_FACTOR` is set to the theoretical value of 0.1904. This must be empirically calibrated using 1% tolerance C0G/NP0 reference capacitors (e.g., 100 pF, 1 nF) to account for LM393 propagation delays and ISR latency.
+The oscillator node carries a fixed parasitic capacitance of ~136 pF on this
+board (an open socket previously read ~124 pF after the old hardcoded −12 pF
+correction), and the ADC cannot resolve sub-nF DUTs at all. The firmware now
+models the oscillator as `T = K·R·C_dut + T0`, where `T0` is a **measured**
+per-range open-node offset that absorbs all parasitic capacitance and fixed
+latency. The old global `STRAY_CAPACITANCE_F` (12 pF) is only a fallback for
+un-tared ranges.
+
+Calibration workflow (OSC debug console, `-DOSC_DEBUG_MODE=1`):
+
+1. `cal1 100` then `cal2 1000` on the 1 MΩ range — two-point solve of `K` and
+   `T0` using two 1% C0G/NP0 references. This cancels the parasitic C exactly.
+2. `zero` — alternatively, with the socket **EMPTY**, tare `T0` directly (then
+   `cal 100` can solve `K` alone). `zeroall` does every usable range.
+3. `cal?` to inspect the stored `K`/`T0` per range; both persist to NVS.
+
+The ADC is now hard-gated below ~1 nF (`ADC_SUBNF_GATE_F`): a 10 pF change on
+the 1 MΩ range is only ~10 µs of τ, below the sample-loop jitter, so small DUTs
+are measured by the tared oscillator only.
+
+## 5. Pending Action Items & Validation Required
+
+* **Tune Oscillator K-Factor:** Still needs the two-point `cal1`/`cal2` run
+  described in §4 with 1% C0G/NP0 references (e.g. 100 pF, 1 nF) to set the
+  real geometry constant `K` and offset `T0`.
 * **ISR Latency Profiling:** The ESP32 FreeRTOS ISR has higher latency than a bare-metal STM32 interrupt. If the loop delay introduces significant non-linearity at sub-100 pF ranges, the feedback loop may need to be offloaded entirely to a hardware gate (e.g., routing the LM393 output directly into the SN74LVC1G34 buffer via a digital switch).
 * **ADC Curve Fitting Verification:** The code utilizes `esp_adc_cali_scheme_curve_fitting`. Verify that the ESP32-eFuse calibration values correctly map the non-linear high end of the ADC curve near the 2085 mV threshold.
 * **Leakage Current Check:** Validate that the 10 kΩ pull-up on the LM393 and the BAT54S leakage do not bleed charge into the RC node during the 600 ms dielectric soak phase.

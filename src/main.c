@@ -77,13 +77,28 @@ static inline int64_t atomic_read_i64(volatile int64_t *p)
 #define V_START_MV 330    // nominal 10 % start threshold (scaled per-range)
 #define V_TAU_FRAC 0.632  // one time constant = 63.2 % of the asymptote
 #define V_NOMINAL_MV 3300 // ideal no-load asymptote
-#define ADC_STEP_THRESHOLD_US 25 // ADC poll jitter budget; τ below this is unusable
+// ADC poll jitter budget.  Below this τ the crossing time is dominated by the
+// sample-loop timing noise, not the RC network.  Raised from 25 µs to 250 µs:
+// a 10 pF DUT on the 1 MΩ range shifts τ by only ~10 µs, so the old gate let
+// the ADC report its own ~136 pF node offset as a "reading" for pF DUTs.
+// 250 µs ≈ 10× the poll jitter and pushes the ADC out of the pF regime
+// entirely — the oscillator owns sub-nF.
+#define ADC_STEP_THRESHOLD_US 250
 
 // Minimum usable asymptote.  Below this the divider droop is so severe that a
 // reliable τ crossing cannot be timed on this range.
 #define V_INF_MIN_MV 900
 
+// Legacy fallback stray.  Used ONLY when the oscillator has no measured
+// open-node tare (T0) for a range.  The real node offset on this board is
+// ~136 pF (an open socket read ~124 pF after the old −12 pF correction), so
+// calibration and measurement must use a measured T0, not this constant.
+// Kept so an un-recalibrated board still behaves as before.
 #define STRAY_CAPACITANCE_F 12.0e-12
+
+// Below this the ADC is not trustworthy: its τ resolution cannot resolve the
+// signal above its own offset.  Small DUTs are measured by the oscillator only.
+#define ADC_SUBNF_GATE_F 1.0e-9
 // C_block (1000 uF) sits in series with the DUT on the AC measurement path.
 // C_eq = C_b*C_d/(C_b+C_d)  =>  C_d = C_eq*C_b/(C_b-C_eq).  Correcting removes
 // the growing underestimate for DUTs approaching C_block (per schematic note).
@@ -132,7 +147,7 @@ static const char *TAG = "CAP_METER";
 // Probe GPIO14 (LM393 out) and GPIO16 (drive) on the scope.  Set back to 0 for
 // normal fused measurement.  (Can also be forced with -DOSC_DEBUG_MODE=1.)
 #ifndef OSC_DEBUG_MODE
-#define OSC_DEBUG_MODE 0
+#define OSC_DEBUG_MODE 1
 #endif
 
 // Current phase of the autoranging pipeline, stamped onto each reading log.
@@ -205,15 +220,18 @@ static bool adc_cali_ready;
 // absorbs the comparator/ISR/buffer latency on fast (low-R) ranges.
 typedef struct {
     double k;        // dimensionless geometry constant for this range
-    double delay_us; // per-cycle time offset (us) for this range
+    double delay_us; // per-cycle time offset (us) for this range (legacy fallback)
+    double t0_us;    // measured open-node period offset (tare):
+                     //   T = K·R·C_dut + T0,  T0 absorbs stray C + latency
     bool   valid;    // true once calibrated against a reference
+    bool   has_t0;   // true once the open-node tare T0 has been captured
 } osc_cal_t;
 
 static osc_cal_t g_osc_cal[RANGE_COUNT] = {
-    {OSC_K_IDEAL, OSC_DELAY_IDEAL_US, false}, // 100 Ω
-    {OSC_K_IDEAL, OSC_DELAY_IDEAL_US, false}, // 1 kΩ
-    {OSC_K_IDEAL, OSC_DELAY_IDEAL_US, false}, // 100 kΩ
-    {OSC_K_IDEAL, OSC_DELAY_IDEAL_US, false}, // 1 MΩ
+    {OSC_K_IDEAL, OSC_DELAY_IDEAL_US, 0.0, false, false}, // 100 Ω
+    {OSC_K_IDEAL, OSC_DELAY_IDEAL_US, 0.0, false, false}, // 1 kΩ
+    {OSC_K_IDEAL, OSC_DELAY_IDEAL_US, 0.0, false, false}, // 100 kΩ
+    {OSC_K_IDEAL, OSC_DELAY_IDEAL_US, 0.0, false, false}, // 1 MΩ
 };
 
 // Accessors used everywhere a K or delay is needed.  They ENFORCE the valid
@@ -227,6 +245,16 @@ static inline double osc_k(uint8_t range_idx)
 static inline double osc_delay(uint8_t range_idx)
 {
     return g_osc_cal[range_idx].valid ? g_osc_cal[range_idx].delay_us : OSC_DELAY_IDEAL_US;
+}
+// Open-node tare offset (period, µs).  Only meaningful when has_t0 is set; the
+// accessor returns 0 when unset so callers must gate on osc_has_t0().
+static inline double osc_t0(uint8_t range_idx)
+{
+    return g_osc_cal[range_idx].t0_us;
+}
+static inline bool osc_has_t0(uint8_t range_idx)
+{
+    return g_osc_cal[range_idx].has_t0;
 }
 
 #define OSC_CAL_NVS_NS "osc_cal"
@@ -252,6 +280,15 @@ static void osc_cal_load(void)
         if (nvs_get_u8(h, key, &valid) == ESP_OK) {
             g_osc_cal[i].valid = (valid != 0);
         }
+        snprintf(key, sizeof(key), "o%d", i);
+        if (nvs_get_i64(h, key, &v) == ESP_OK) {
+            g_osc_cal[i].t0_us = (double)v / 1e6;   // fixed-point 1e6
+        }
+        snprintf(key, sizeof(key), "t%d", i);
+        uint8_t has_t0 = 0;
+        if (nvs_get_u8(h, key, &has_t0) == ESP_OK) {
+            g_osc_cal[i].has_t0 = (has_t0 != 0);
+        }
     }
     nvs_close(h);
 }
@@ -270,43 +307,55 @@ static esp_err_t osc_cal_save(void)
         nvs_set_i64(h, key, (int64_t)(g_osc_cal[i].delay_us * 1e6));
         snprintf(key, sizeof(key), "v%d", i);
         nvs_set_u8(h, key, g_osc_cal[i].valid ? 1 : 0);
+        snprintf(key, sizeof(key), "o%d", i);
+        nvs_set_i64(h, key, (int64_t)(g_osc_cal[i].t0_us * 1e6));
+        snprintf(key, sizeof(key), "t%d", i);
+        nvs_set_u8(h, key, g_osc_cal[i].has_t0 ? 1 : 0);
     }
     err = nvs_commit(h);
     nvs_close(h);
     return err;
 }
 
-// Convert a nominal reference DUT value into the series-equivalent C_eq the
-// circuit actually sees.  This MUST match the model used in measurement
-// (cblock_invert), otherwise calibration and measurement disagree.
+// Series-equivalent of a DUT *alone* (no stray).  The oscillator's measured
+// open-node tare T0 absorbs the parasitic capacitance, so calibration works in
+// DUT deltas above the open baseline and must NOT add STRAY here.  Adding the
+// old 12 pF constant was the bug that made a 100 pF reference imply ~236 pF and
+// pushed the solved K ~2.1× too large.  This MUST stay consistent with the
+// measurement model (cblock_invert).
 static double cblock_forward(double c_dut)
 {
-    double c_total = c_dut + STRAY_CAPACITANCE_F;   // stray in parallel
-    if (c_total >= C_BLOCK_F) return -1.0;          // beyond singularity
-    return (C_BLOCK_F * c_total) / (C_BLOCK_F + c_total);
+    if (c_dut >= C_BLOCK_F) return -1.0;            // beyond singularity
+    return (C_BLOCK_F * c_dut) / (C_BLOCK_F + c_dut);
 }
 
-// One-point calibration: solve K assuming the current delay is correct.
-//   T_meas = K·R·C_eq + delay   =>   K = (T_meas − delay)/(R·C_eq)
-// Uses the C_eq model so calibration and measurement are consistent.
+// One-point calibration: solve K.
+//   With tare:    T = K·R·C_dut + T0      => K = (T − T0)/(R·C_dut)
+//   Legacy (no tare): T = K·R·(C_dut+Cstray) + delay
+//                                          => K = (T − delay)/(R·(C_dut+Cstray))
+// Prefer the measured open-node tare so K is independent of the unknown
+// parasitic capacitance.  Uses the same C_eq model as measurement.
 static double osc_cal_solve_k(uint8_t range_idx, double freq_hz, double ref_c_f)
 {
-    double c_eq = cblock_forward(ref_c_f);
+    bool use_t0 = osc_has_t0(range_idx);
+    double c_eq = cblock_forward(ref_c_f + (use_t0 ? 0.0 : STRAY_CAPACITANCE_F));
     double period_us = 1e6 / freq_hz;
-    double eff = period_us - osc_delay(range_idx);
+    double eff = period_us - (use_t0 ? osc_t0(range_idx) : osc_delay(range_idx));
     if (c_eq <= 0.0 || eff <= 0.0) return -1.0;
     return (eff * 1e-6) / (RANGES[range_idx].resistance_ohms * c_eq);
 }
 
-// Two-point calibration: with TWO references on the SAME range we can solve
-// BOTH unknowns of  T = K·R·C_eq + D  exactly:
-//      K = (T1 − T2) / (R · (Ceq1 − Ceq2))
-//      D = T1 − K·R·Ceq1
-// Returns true on success and writes the solved values into *k / *delay_us.
+// Two-point calibration: with TWO references on the SAME range we solve BOTH
+// unknowns of  T = K·R·C_dut + T0  exactly.  This is the clean way to cancel
+// the parasitic capacitance: Ceq is the reference's DUT value only (no stray),
+// and T0 absorbs the stray + all fixed latency.
+//      K  = (T1 − T2) / (R · (Ceq1 − Ceq2))
+//      T0 = T1 − K·R·Ceq1
+// Returns true on success and writes the solved values into *k / *t0_us.
 static bool osc_cal_solve_two_point(uint8_t range_idx,
                                     double f1_hz, double ref1_c_f,
                                     double f2_hz, double ref2_c_f,
-                                    double *k, double *delay_us)
+                                    double *k, double *t0_us)
 {
     double ceq1 = cblock_forward(ref1_c_f);
     double ceq2 = cblock_forward(ref2_c_f);
@@ -319,15 +368,16 @@ static bool osc_cal_solve_two_point(uint8_t range_idx,
     if (fabs(dc) < 1e-18) return false;             // references too similar
 
     double k_solved = ((t1 - t2) * 1e-6) / (r * dc);
-    double d_solved = t1 - k_solved * r * ceq1 * 1e6;
+    double t0_solved = t1 - k_solved * r * ceq1 * 1e6;
 
-    // Sanity: K must be a sane positive geometry constant; delay must be small
-    // and positive-ish (a large negative delay means the references were bad).
+    // Sanity: K must be a sane positive geometry constant; T0 is a period
+    // offset (positive, up to a few hundred µs on the 1 MΩ range).  A large
+    // negative T0 means the references were bad/too similar.
     if (k_solved <= 0.01 || k_solved > 2.0) return false;
-    if (d_solved < -50.0 || d_solved > 100.0) return false;
+    if (t0_solved < -100.0 || t0_solved > 200000.0) return false;
 
     *k = k_solved;
-    *delay_us = d_solved;
+    *t0_us = t0_solved;
     return true;
 }
 
@@ -563,9 +613,11 @@ static void log_sample(const char *phase, const sample_t *s)
 
     if (s->method == METHOD_OSC) {
         if (s->valid) {
+            double off = osc_has_t0(s->range_idx) ? osc_t0(s->range_idx)
+                                                  : osc_delay(s->range_idx);
             ESP_LOGI(TAG,
-                     "  [%s] OSC %6s | T %8.1f us | f %8.1f Hz | C %10s | q %.3f | %s",
-                     phase, range, s->tau_us, s->freq_hz, cap, s->quality, verdict);
+                     "  [%s] OSC %6s | T %8.1f us (T0 %7.1f) | f %8.1f Hz | C %10s | q %.3f | %s",
+                     phase, range, s->tau_us, off, s->freq_hz, cap, s->quality, verdict);
         } else {
             ESP_LOGW(TAG, "  [%s] OSC %6s | no oscillation / timeout | %s",
                      phase, range, verdict);
@@ -883,9 +935,9 @@ static sample_t measure_adc_range(uint8_t range_idx)
     else                       q_fit = 0.4 + 0.6 * s.fit_r2;     // scale by R²
 
     double q = q_time * q_stray * q_range * q_fit;
-    // A *clean* (plausible, well-fit) ADC tau is a real measurement even at the
-    // bottom of the window; keep a floor so it is not crushed to ~0.
-    if (q < 0.15) q = 0.15;
+    // No artificial quality floor: with the ADC hard-gated at
+    // ADC_STEP_THRESHOLD_US, sub-floor/noisy samples never reach scoring, so a
+    // low q here is genuine (leaky/non-exponential) and must be allowed to sink.
     s.quality = q;
 
     log_sample(g_phase, &s);
@@ -1017,13 +1069,18 @@ static sample_t measure_osc_range(uint8_t range_idx)
         return s;
     }
 
-    // Subtract the per-range fixed delay from the measured period, then apply
-    // the per-range geometry constant.  This is the calibrated relationship
-    //      T_meas = K_range·R·C + delay_range   =>   C = (T_meas − delay)/(K·R)
+    // Convert period to capacitance.  Preferred model uses the measured
+    // open-node tare:
+    //      T = K·R·(C_stray + C_dut) + latency  ⇒  T = K·R·C_dut + T0
+    //      C_eq = (T − T0)/(K·R)   (T0 absorbs ALL parasitic C + fixed delays)
+    // Legacy fallback (no tare): subtract the fixed delay, keep the nominal
+    // stray removal below so an un-calibrated board behaves as before.
     double period_us = 1e6 / freq_hz;
-    double eff_period_us = period_us - osc_delay(range_idx);
+    bool use_t0 = osc_has_t0(range_idx);
+    double eff_period_us = period_us - (use_t0 ? osc_t0(range_idx)
+                                               : osc_delay(range_idx));
 
-    // T_meas ≤ delay is non-physical (would imply a negative/zero RC time).
+    // T_meas ≤ offset is non-physical (would imply a negative/zero RC time).
     // Reject outright instead of clamping to a fake positive capacitance.
     if (eff_period_us <= 0.0) {
         s.freq_hz = freq_hz;
@@ -1037,8 +1094,8 @@ static sample_t measure_osc_range(uint8_t range_idx)
     s.freq_hz = freq_hz;
     s.suspicious = false;
 
-    // C_eq = (T − delay) / (K_range · R); then invert C_block series, THEN
-    // subtract parallel stray (correct order; see cblock_invert).
+    // C_eq = (T − T0)/(K·R) is the DUT series-equivalent (stray already tared);
+    // invert the C_block series combo for large DUTs.
     double c_eq = (eff_period_us * 1e-6) /
                   (osc_k(range_idx) * RANGES[range_idx].resistance_ohms);
     s.c_eq_f = c_eq;
@@ -1048,7 +1105,9 @@ static sample_t measure_osc_range(uint8_t range_idx)
         log_sample(g_phase, &s);
         return s;                                     // invalid
     }
-    double c = c_total - STRAY_CAPACITANCE_F;
+    // With a tare, c_total IS the DUT (stray already removed).  Legacy path
+    // still needs the nominal stray subtracted.
+    double c = use_t0 ? c_total : (c_total - STRAY_CAPACITANCE_F);
     if (c < 0.0) c = 0.0;
     s.capacitance_f = c;
 
@@ -1056,7 +1115,11 @@ static sample_t measure_osc_range(uint8_t range_idx)
     if (freq_hz < OSC_MIN_F_HZ)          { log_sample(g_phase, &s); return s; } // too slow / leaky
     if (freq_hz > 1000000.0)             { log_sample(g_phase, &s); return s; } // too fast for comparator
     if (n_periods < 4)                   { log_sample(g_phase, &s); return s; } // too few edges to trust
-    if (c < 0.5 * STRAY_CAPACITANCE_F)   { log_sample(g_phase, &s); return s; } // stray floor
+    // Noise floor: with a tare the parasitic C is removed, so the limit is the
+    // timing-noise resolution (sub-pF), NOT the old 6 pF stray fraction.  An
+    // un-tared range still uses the legacy floor.
+    double c_floor = use_t0 ? 0.5e-12 : 0.5 * STRAY_CAPACITANCE_F;
+    if (c < c_floor)                     { log_sample(g_phase, &s); return s; }
     s.plausible = true;
 
     // ---- Quality scoring ----
@@ -1075,7 +1138,10 @@ static sample_t measure_osc_range(uint8_t range_idx)
     // is not available from a hardware-counted average).
     double q_count = (n_periods >= OSC_TARGET_PERIODS) ? 1.0
                      : 0.6 + 0.4 * ((double)n_periods / (double)OSC_TARGET_PERIODS);
-    double q_stray = c / (c + 3.0 * STRAY_CAPACITANCE_F);
+    // With a tare, small DUTs are credible: use a sub-pF noise reference rather
+    // than penalising every reading below ~36 pF as "stray-dominated".
+    double q_stray = use_t0 ? (c / (c + 0.5e-12))
+                            : (c / (c + 3.0 * STRAY_CAPACITANCE_F));
     s.quality = q_freq * q_count * q_stray;
 
     log_sample(g_phase, &s);
@@ -1228,10 +1294,18 @@ static fusion_t measure_capacitance_autoranged(void)
     int osc_best_range = -1;
     double osc_best_cost = 1e30;
 
+    // The ADC cannot resolve sub-nF DUTs (a 10 pF signal on 1 MΩ is ~10 µs of
+    // τ, below the sample-loop jitter).  When the oscillator already tells us
+    // the DUT is small, skip the ADC entirely and let the tared oscillator own
+    // the measurement — otherwise the ADC's ~136 pF node offset leaks in as a
+    // bogus ~170 pF reading.
+    bool sub_nf = have_rough && rough_c > 0.0 && rough_c < ADC_SUBNF_GATE_F;
+
     if (have_rough && rough_c > 0.0) {
         for (int r = 0; r < RANGE_COUNT; ++r) {
             double tau_us = rough_c * RANGES[r].resistance_ohms * 1e6;
-            if (tau_us >= 30.0 && tau_us <= 4.0e6) adc_tried[r] = true;
+            if (!sub_nf && tau_us >= (double)ADC_STEP_THRESHOLD_US && tau_us <= 4.0e6)
+                adc_tried[r] = true;
 
             double f_pred = 1.0 / (osc_k((uint8_t)r) * RANGES[r].resistance_ohms * rough_c);
             // OSC confirmation where the loop is genuinely informative: above
@@ -1407,12 +1481,17 @@ static void dbg_print_state(int range_idx)
            (unsigned long)dbg_isr_calls, (unsigned long)dbg_edges,
            cnt, (long long)(t1 - t0), f);
     if (f > 0.0) {
-        double eff_us = 1e6 / f - osc_delay((uint8_t)range_idx);
-        double c = (eff_us * 1e-6) / (osc_k((uint8_t)range_idx) *
-                                      RANGES[range_idx].resistance_ohms);
-        printf("  -> implied C = %.3f nF  (K=%.4f delay=%.2fus R=%s%s)\n",
-               c * 1e9, osc_k((uint8_t)range_idx), osc_delay((uint8_t)range_idx),
-               RANGES[range_idx].label, g_osc_cal[range_idx].valid ? " cal" : " default");
+        bool use_t0 = osc_has_t0((uint8_t)range_idx);
+        double off_us = use_t0 ? osc_t0((uint8_t)range_idx)
+                               : osc_delay((uint8_t)range_idx);
+        double eff_us = 1e6 / f - off_us;
+        double c_eq = (eff_us * 1e-6) / (osc_k((uint8_t)range_idx) *
+                                         RANGES[range_idx].resistance_ohms);
+        double c = use_t0 ? c_eq : (c_eq - STRAY_CAPACITANCE_F);
+        printf("  -> implied C = %.3f nF  (K=%.4f %s=%.2fus R=%s%s)\n",
+               c * 1e9, osc_k((uint8_t)range_idx), use_t0 ? "T0" : "delay",
+               off_us, RANGES[range_idx].label,
+               g_osc_cal[range_idx].valid ? " cal" : " default");
     }
     printf("-----------------\n\n");
 }
@@ -1571,8 +1650,56 @@ static double dbg_capture_point(int range_idx, double ref_pf, double *ref_c_out)
     return f;
 }
 
-// 'cal <ref_pF>'        — one-point: solve K (delay kept), C_eq-consistent.
-// 'cal1 <ref_pF>' then 'cal2 <ref_pF>' — two-point: solve K AND delay exactly.
+// Tare the open-node offset T0.  With the DUT socket EMPTY, average several
+// oscillator periods and store T0 ≈ K·R·C_stray + latency.  Subtracting T0 in
+// the measurement removes the parasitic capacitance, which is the whole point
+// of sub-nF operation.  range_or_all < 0 => every range (low-R ranges usually
+// oscillate too fast to tare and are skipped with a message).
+static void dbg_tare(int range_or_all)
+{
+    int first = (range_or_all < 0) ? 0 : range_or_all;
+    int last  = (range_or_all < 0) ? RANGE_COUNT - 1 : range_or_all;
+
+    for (int r = first; r <= last; ++r) {
+        bool was = osc_running;
+        dbg_stop();
+        select_mux_channel(RANGES[r].mux_channel);
+        esp_rom_delay_us(5);
+        prepare_measurement();          // discharge the node first
+        if (!was) dbg_start();
+        vTaskDelay(pdMS_TO_TICKS(60));  // let the loop settle
+
+        double acc = 0.0;
+        int got = 0;
+        for (int k = 0; k < 8; ++k) {
+            double f = dbg_measure_freq();
+            if (f > 0.0) { acc += 1e6 / f; got++; }
+            esp_task_wdt_reset();
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        if (!was) dbg_stop();
+
+        if (got == 0) {
+            printf(">> %s: no oscillation with socket empty "
+                   "(range too fast / unusable for tare)\n", RANGES[r].label);
+            continue;
+        }
+        double period = acc / (double)got;
+        g_osc_cal[r].t0_us = period;
+        g_osc_cal[r].has_t0 = true;
+        esp_err_t e = osc_cal_save();
+        double k = osc_k((uint8_t)r);
+        double r_ohm = RANGES[r].resistance_ohms;
+        double stray_pf = (k * r_ohm > 0.0)
+                              ? (period * 1e-6) / (k * r_ohm) * 1e12 : 0.0;
+        printf(">> %s TARE: T0 = %.2f us  (implied parasitic C = %.1f pF)  %s\n",
+               RANGES[r].label, period, stray_pf,
+               (e == ESP_OK) ? "saved to NVS" : "NVS SAVE FAILED");
+    }
+}
+
+// 'cal <ref_pF>'        — one-point: solve K (uses T0 if tared), C_eq-consistent.
+// 'cal1 <ref_pF>' then 'cal2 <ref_pF>' — two-point: solve K AND T0 exactly.
 static void dbg_calibrate(int range_idx, const char *cmd, double ref_pf)
 {
     bool two_first  = (strncmp(cmd, "cal1", 4) == 0);
@@ -1601,19 +1728,20 @@ static void dbg_calibrate(int range_idx, const char *cmd, double ref_pf)
         double f2 = dbg_capture_point(range_idx, ref_pf, &ref_c2);
         if (f2 <= 0.0) { g_cal_pending = false; return; }
 
-        double k, d;
+        double k, t0;
         if (!osc_cal_solve_two_point((uint8_t)range_idx,
-                                     g_cal_f1, g_cal_ref1, f2, ref_c2, &k, &d)) {
+                                     g_cal_f1, g_cal_ref1, f2, ref_c2, &k, &t0)) {
             printf(">> CAL FAILED: two-point solve rejected (refs too similar / non-physical).\n");
             g_cal_pending = false;
             return;
         }
         g_osc_cal[range_idx].k = k;
-        g_osc_cal[range_idx].delay_us = d;
+        g_osc_cal[range_idx].t0_us = t0;
+        g_osc_cal[range_idx].has_t0 = true;
         g_osc_cal[range_idx].valid = true;
         esp_err_t e = osc_cal_save();
-        printf(">> %s TWO-POINT: K=%.5f delay=%.3f us  (refs %.4g pF + %.4g pF)  %s\n",
-               RANGES[range_idx].label, k, d,
+        printf(">> %s TWO-POINT: K=%.5f T0=%.3f us  (refs %.4g pF + %.4g pF)  %s\n",
+               RANGES[range_idx].label, k, t0,
                g_cal_ref1 * 1e12, ref_c2 * 1e12,
                (e == ESP_OK) ? "saved to NVS" : "NVS SAVE FAILED");
         g_cal_pending = false;
@@ -1632,9 +1760,12 @@ static void dbg_calibrate(int range_idx, const char *cmd, double ref_pf)
     g_osc_cal[range_idx].k = k;
     g_osc_cal[range_idx].valid = true;
     esp_err_t e = osc_cal_save();
-    printf(">> %s ONE-POINT: K=%.5f (delay held at %.2f us)  ref=%.1f pF  %s\n",
-           RANGES[range_idx].label, k, g_osc_cal[range_idx].delay_us, ref_pf,
-           (e == ESP_OK) ? "saved to NVS" : "NVS SAVE FAILED");
+    printf(">> %s ONE-POINT: K=%.5f (%s %.2f us)  ref=%.1f pF  %s\n",
+           RANGES[range_idx].label, k,
+           osc_has_t0((uint8_t)range_idx) ? "T0 held at" : "delay held at (no tare!)",
+           osc_has_t0((uint8_t)range_idx) ? osc_t0((uint8_t)range_idx)
+                                          : g_osc_cal[range_idx].delay_us,
+           ref_pf, (e == ESP_OK) ? "saved to NVS" : "NVS SAVE FAILED");
 }
 
 void app_main(void)
@@ -1666,8 +1797,10 @@ void app_main(void)
     printf("\n=== OSC DEBUG CONSOLE ===\n"
            "range=%s\n"
            "  0-3 range | g start | s stop | r restart | p state\n"
+           "  zero      tare T0 with the socket EMPTY (removes parasitic C)\n"
+           "  zeroall   tare every range\n"
            "  cal <ref_pF>   calibrate current range vs known cap (e.g. 'cal 1000')\n"
-           "  cal?           show calibration table | h help\n\n",
+           "  cal1/cal2 <ref_pF>  two-point K+T0 | cal? table | h help\n\n",
            RANGES[range_idx].label);
 
     char line[64];
@@ -1688,9 +1821,13 @@ void app_main(void)
             bool was = osc_running;
             dbg_stop();
             select_mux_channel(RANGES[range_idx].mux_channel);
-            printf(">> range=%s (K=%.5f delay=%.2fus %s)\n", RANGES[range_idx].label,
-                   osc_k((uint8_t)range_idx), osc_delay((uint8_t)range_idx),
-                   g_osc_cal[range_idx].valid ? "cal" : "default");
+            printf(">> range=%s (K=%.5f %s=%.2fus %s%s)\n", RANGES[range_idx].label,
+                   osc_k((uint8_t)range_idx),
+                   osc_has_t0((uint8_t)range_idx) ? "T0" : "delay",
+                   osc_has_t0((uint8_t)range_idx) ? osc_t0((uint8_t)range_idx)
+                                                  : osc_delay((uint8_t)range_idx),
+                   g_osc_cal[range_idx].valid ? "cal" : "default",
+                   osc_has_t0((uint8_t)range_idx) ? " tared" : "");
             if (was) dbg_start();
         } else if (!strcmp(line, "g")) {
             dbg_start(); printf(">> STARTED (drive=%d)\n", gpio_get_level(DRIVE_PIN));
@@ -1709,11 +1846,17 @@ void app_main(void)
                 if (line[i] >= '0' && line[i] <= '3') { rr = line[i] - '0'; break; }
             }
             dbg_probe_range(rr);
+        } else if (!strcmp(line, "zero")) {
+            dbg_tare(range_idx);
+        } else if (!strcmp(line, "zeroall")) {
+            dbg_tare(-1);
         } else if (!strncmp(line, "cal?", 4)) {
             printf("\n--- OSC calibration ---\n");
             for (int i = 0; i < RANGE_COUNT; ++i) {
-                printf("  %-7s K=%.5f  delay=%.2f us  %s\n", RANGES[i].label,
-                       g_osc_cal[i].k, g_osc_cal[i].delay_us,
+                printf("  %-7s K=%.5f  T0=%.2f us %-9s delay=%.2f us  %s\n",
+                       RANGES[i].label, g_osc_cal[i].k, g_osc_cal[i].t0_us,
+                       g_osc_cal[i].has_t0 ? "(tared)" : "(no tare)",
+                       g_osc_cal[i].delay_us,
                        g_osc_cal[i].valid ? "calibrated" : "default");
             }
             printf("-----------------------\n\n");
@@ -1734,8 +1877,9 @@ void app_main(void)
         } else if (!strcmp(line, "h")) {
             printf("0-3 range | g start | s stop | r restart | p state\n"
                    "probe <0-3>  connectivity test: drive node + watch V_cap charge\n"
-                   "cal <pF>  one-point K (delay held)\n"
-                   "cal1 <pF> then cal2 <pF>  two-point K+delay (use 2 different refs)\n"
+                   "zero  tare T0 with socket EMPTY (removes parasitic C) | zeroall all ranges\n"
+                   "cal <pF>  one-point K (uses T0 if tared)\n"
+                   "cal1 <pF> then cal2 <pF>  two-point K+T0 (use 2 different refs)\n"
                    "cal? show table | h help\n");
         } else {
             printf(">> unknown '%s' (h for help)\n", line);
@@ -1759,9 +1903,13 @@ void app_main(void)
     osc_cal_load();
     ESP_LOGI(TAG, "ESP32 fusion capacitance meter ready (multi-range ADC + OSC)");
     for (int i = 0; i < RANGE_COUNT; ++i) {
-        if (g_osc_cal[i].valid) {
-            ESP_LOGI(TAG, "  %s: K=%.5f delay=%.2f us (calibrated)",
-                     RANGES[i].label, g_osc_cal[i].k, g_osc_cal[i].delay_us);
+        if (g_osc_cal[i].valid || g_osc_cal[i].has_t0) {
+            ESP_LOGI(TAG, "  %s: K=%.5f %s=%.2f us (%s%s)",
+                     RANGES[i].label, g_osc_cal[i].k,
+                     g_osc_cal[i].has_t0 ? "T0" : "delay",
+                     g_osc_cal[i].has_t0 ? g_osc_cal[i].t0_us : g_osc_cal[i].delay_us,
+                     g_osc_cal[i].valid ? "calibrated" : "default K",
+                     g_osc_cal[i].has_t0 ? ", tared" : "");
         }
     }
 
