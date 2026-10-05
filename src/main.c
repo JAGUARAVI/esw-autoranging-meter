@@ -147,7 +147,7 @@ static const char *TAG = "CAP_METER";
 // Probe GPIO14 (LM393 out) and GPIO16 (drive) on the scope.  Set back to 0 for
 // normal fused measurement.  (Can also be forced with -DOSC_DEBUG_MODE=1.)
 #ifndef OSC_DEBUG_MODE
-#define OSC_DEBUG_MODE 1
+#define OSC_DEBUG_MODE 0
 #endif
 
 // Current phase of the autoranging pipeline, stamped onto each reading log.
@@ -456,6 +456,21 @@ static int adc_read_avg_mv(int samples)
     return (int)(acc / got);
 }
 
+// ---------------------------------------------------------------------------
+// Interactive / telemetry state (shared by the debug console and normal mode)
+// ---------------------------------------------------------------------------
+// Declared early: the measurement loops below poll these to abort promptly when
+// an exclusive command (zero/cal/probe) arrives mid-cycle.
+static bool g_stream = false;        // emit @@EVT machine-readable events
+static bool g_stream_curve = false;  // include the full ADC charge curve
+static bool g_run = true;            // normal mode: continuous autoranging
+static int  g_range_lock = -1;       // normal mode: -1 = auto, else range index
+static bool g_single_shot = false;   // measure one cycle then stop
+static volatile bool g_abort_cycle = false;
+static volatile bool g_measuring = false;
+static uint8_t g_console_range = 2;  // range used by cal/probe/status
+static char g_pending_cmd[64];       // exclusive command queued during a cycle
+
 // Wait until V_cap falls below V_START_MV (100 kΩ and 1 MΩ ranges bleed charge
 // slowly, so the budget scales with the range resistor).
 static bool wait_for_start_threshold(uint8_t range_idx)
@@ -463,12 +478,17 @@ static bool wait_for_start_threshold(uint8_t range_idx)
     int64_t budget_us = 100000LL + (int64_t)(RANGES[range_idx].resistance_ohms * 2.0);
     int64_t t0 = esp_timer_get_time();
     while ((esp_timer_get_time() - t0) < budget_us) {
+        if (g_abort_cycle) return false;   // service an exclusive command promptly
         int mv = adc_read_avg_mv(2);
         if (mv >= 0 && mv <= V_START_MV) return true;
         esp_rom_delay_us(200);
     }
     return false;
 }
+
+// Defined further down but needed by the measurement loops (abort-on-command).
+static void service_console(void);
+static void safe_delay_ms(uint32_t ms);
 
 // Full safe state cycle: pre-charge DUT at bias, discharge, isolate.
 static void prepare_measurement(void)
@@ -480,11 +500,11 @@ static void prepare_measurement(void)
     gpio_set_level(SSR_S2_PIN, 1);
     gpio_set_level(SSR_S1_S3_PIN, 1);
     gpio_set_level(DRIVE_PIN, 1);
-    vTaskDelay(pdMS_TO_TICKS(PRECHARGE_HOLD_MS));
+    safe_delay_ms(PRECHARGE_HOLD_MS);   // console-aware: an abort shortens it
 
     gpio_set_level(DRIVE_PIN, 0);
     gpio_set_level(SSR_S1_S3_PIN, 0);
-    vTaskDelay(pdMS_TO_TICKS(DISCHARGE_HOLD_MS));
+    safe_delay_ms(DISCHARGE_HOLD_MS);
 
     gpio_set_level(SSR_S2_PIN, 0);
     esp_rom_delay_us(ISOLATION_DELAY_US);
@@ -603,6 +623,112 @@ static void fmt_cap(double c, char *buf, size_t len)
 // Per-range measured asymptote cache (mV); defined below, used by logging.
 extern int g_v_inf_cache[RANGE_COUNT];
 
+// ---------------------------------------------------------------------------
+// Interactive / telemetry state (shared by the debug console and normal mode)
+// ---------------------------------------------------------------------------
+// Machine-readable telemetry is emitted as single-line JSON after the "@@EVT "
+// sentinel.  Emission happens from the single measurement/console task, so it
+// never interleaves with ESP_LOG output.  Human log lines are untouched.
+// (The interactive/telemetry state globals are declared earlier, before the
+// measurement loops that consume them.)
+
+// Print a double as JSON, emitting null for non-finite values (JSON has no NaN).
+static void json_num(char *buf, size_t len, double v)
+{
+    if (isnan(v) || isinf(v)) snprintf(buf, len, "null");
+    else snprintf(buf, len, "%.9g", v);
+}
+
+static void evt_boot(void)
+{
+    if (!g_stream) return;
+    printf("@@EVT {\"t\":\"boot\",\"fw\":\"ESWCap\",\"ranges\":[");
+    for (int i = 0; i < RANGE_COUNT; ++i) {
+        if (i) printf(",");
+        printf("{\"i\":%d,\"label\":\"%s\",\"r\":%.0f,\"mux\":%d,\"k\":%.6g,"
+               "\"t0_us\":%.6g,\"has_t0\":%s,\"valid\":%s}",
+               i, RANGES[i].label, RANGES[i].resistance_ohms, RANGES[i].mux_channel,
+               g_osc_cal[i].k, g_osc_cal[i].t0_us,
+               g_osc_cal[i].has_t0 ? "true" : "false",
+               g_osc_cal[i].valid ? "true" : "false");
+    }
+    printf("]}\n");
+}
+
+static void evt_cycle(const fusion_t *f)
+{
+    if (!g_stream) return;
+    char adc[32], osc[32];
+    json_num(adc, sizeof(adc), f->adc_estimate);
+    json_num(osc, sizeof(osc), f->osc_estimate);
+    printf("@@EVT {\"t\":\"cycle\",\"ts_ms\":%lld,\"valid\":%s,\"c\":%.9g,"
+           "\"spread\":%.6g,\"weight\":%.6g,\"n_adc\":%d,\"n_osc\":%d,\"raw\":%d,"
+           "\"adc\":%s,\"osc\":%s,\"mismatch\":%s}\n",
+           (long long)(esp_timer_get_time() / 1000), f->valid ? "true" : "false",
+           f->capacitance_f, f->rel_spread, f->total_weight, f->n_adc, f->n_osc,
+           f->raw_samples, adc, osc, f->method_mismatch ? "true" : "false");
+}
+
+static void evt_sample(const sample_t *s)
+{
+    if (!g_stream) return;
+    double vinf = (s->method == METHOD_ADC_STEP)
+                      ? (double)g_v_inf_cache[s->range_idx] : -1.0;
+    printf("@@EVT {\"t\":\"sample\",\"phase\":\"%s\",\"method\":\"%s\",\"range\":%d,"
+           "\"label\":\"%s\",\"valid\":%s,\"plausible\":%s,\"c\":%.9g,\"c_eq\":%.9g,"
+           "\"q\":%.6g,\"tau_us\":%.6g,\"freq\":%.6g,\"r2\":%.6g,\"vinf\":%.0f}\n",
+           g_phase, s->method == METHOD_ADC_STEP ? "adc" : "osc",
+           s->range_idx, RANGES[s->range_idx].label,
+           s->valid ? "true" : "false", s->plausible ? "true" : "false",
+           s->capacitance_f, s->c_eq_f, s->quality, s->tau_us, s->freq_hz,
+           s->fit_r2, vinf);
+}
+
+static void evt_curve(uint8_t range_idx, int vinf, double tau_us, double r2,
+                      const int64_t *ts, const int *mv, int n)
+{
+    if (!g_stream || !g_stream_curve) return;
+    printf("@@EVT {\"t\":\"curve\",\"range\":%d,\"vinf\":%d,\"tau_us\":%.6g,"
+           "\"r2\":%.6g,\"pts\":[", range_idx, vinf, tau_us, r2);
+    for (int i = 0; i < n; ++i)
+        printf("%s[%lld,%d]", i ? "," : "", (long long)(ts[i] - ts[0]), mv[i]);
+    printf("]}\n");
+}
+
+static void evt_calpt(int range_idx, const char *op, double ref_pf, double freq)
+{
+    if (!g_stream) return;
+    printf("@@EVT {\"t\":\"calpt\",\"op\":\"%s\",\"range\":%d,\"ref_pf\":%.6g,"
+           "\"freq\":%.6g,\"period_us\":%.6g}\n",
+           op, range_idx, ref_pf, freq, freq > 0.0 ? 1e6 / freq : 0.0);
+}
+
+static void evt_calres(int range_idx, const char *op, double k, double t0, int ok)
+{
+    if (!g_stream) return;
+    printf("@@EVT {\"t\":\"calres\",\"op\":\"%s\",\"range\":%d,\"k\":%.6g,"
+           "\"t0_us\":%.6g,\"ok\":%s}\n",
+           op, range_idx, k, t0, ok ? "true" : "false");
+}
+
+static void evt_tare(int range_idx, int idx, int total, double freq,
+                     double t0_us, double stray_pf, int done)
+{
+    if (!g_stream) return;
+    printf("@@EVT {\"t\":\"tare\",\"range\":%d,\"idx\":%d,\"total\":%d,"
+           "\"freq\":%.6g,\"period_us\":%.6g,\"t0_us\":%.6g,\"stray_pf\":%.6g,"
+           "\"done\":%s}\n",
+           range_idx, idx, total, freq, freq > 0.0 ? 1e6 / freq : 0.0,
+           t0_us, stray_pf, done ? "true" : "false");
+}
+
+static void evt_ack(const char *cmd, int ok, const char *msg)
+{
+    if (!g_stream) return;
+    printf("@@EVT {\"t\":\"ack\",\"cmd\":\"%s\",\"ok\":%s,\"msg\":\"%s\"}\n",
+           cmd, ok ? "true" : "false", msg);
+}
+
 // Log a single raw reading (one range / one method) with its verdict.
 static void log_sample(const char *phase, const sample_t *s)
 {
@@ -640,6 +766,9 @@ static void log_sample(const char *phase, const sample_t *s)
                      phase, range, verdict);
         }
     }
+
+    // Machine-readable mirror of exactly this reading (valid or not).
+    evt_sample(s);
 }
 
 // Per-range measured asymptote cache (mV).  0 = not yet measured.
@@ -732,7 +861,8 @@ static int adc_asymptote_for_range(uint8_t range_idx, int v_start)
         // settled: slope under ~8 mV per 20 ms and clearly above the start
         if ((mv - v_prev) < 8 && mv > v_start + 200) { v_inf = mv; break; }
         v_prev = mv;
-        vTaskDelay(pdMS_TO_TICKS(20));
+        safe_delay_ms(20);
+        if (g_abort_cycle) break;
     }
     gpio_set_level(DRIVE_PIN, 0);
 
@@ -816,6 +946,13 @@ static sample_t measure_adc_range(uint8_t range_idx)
     int64_t t_start = -1, t_tau = -1;
     int64_t t_last_feed = t_begin;
     while (true) {
+        // Service the console so an exclusive command (zero/cal/probe) can abort
+        // this cycle promptly; a queued command also sets g_abort_cycle.
+        service_console();
+        if (g_abort_cycle) {
+            gpio_set_level(DRIVE_PIN, 0);
+            return s;
+        }
         int mv;
         int64_t t_before = esp_timer_get_time();
         if (!read_vcap_mv(&mv)) {
@@ -875,6 +1012,10 @@ static sample_t measure_adc_range(uint8_t range_idx)
         log_sample(g_phase, &s);
         return s; // never crossed: too large for this range
     }
+
+    // Stream the captured charge curve + fitted exponential for the UI graph.
+    evt_curve(range_idx, v_inf, used_fit ? tau_us : -1.0,
+              used_fit ? fit_r2 : -1.0, ts, mvs, npts);
 
     s.valid = true;
     s.tau_us = tau_us;
@@ -999,7 +1140,9 @@ static bool osc_period_frequency(double *freq_hz, uint32_t *periods_out)
         int64_t now = esp_timer_get_time();
         if (osc_edge_count >= OSC_PERIOD_MAX_EDGES) break;
         if ((now - t0) >= OSC_PERIOD_TIMEOUT_US) break;
+        if (g_abort_cycle) break;
         esp_task_wdt_reset();
+        service_console();
         vTaskDelay(pdMS_TO_TICKS(1));
     }
     osc_running = false;
@@ -1307,7 +1450,14 @@ static fusion_t measure_capacitance_autoranged(void)
             if (!sub_nf && tau_us >= (double)ADC_STEP_THRESHOLD_US && tau_us <= 4.0e6)
                 adc_tried[r] = true;
 
-            double f_pred = 1.0 / (osc_k((uint8_t)r) * RANGES[r].resistance_ohms * rough_c);
+            // Predict the *measured* period, including the per-range open-node
+            // tare T0.  Without T0 a small DUT is wildly over-predicted: 10 pF
+            // on 1 MΩ looks like 100 kHz (τ=10 µs) when the real loop runs at
+            // ~5.4 kHz (T=K·R·C + T0 ≈ 184 µs), so no range ever qualified and
+            // the successful probe was thrown away.
+            double t_pred_us = osc_k((uint8_t)r) * RANGES[r].resistance_ohms * rough_c * 1e6;
+            if (osc_has_t0((uint8_t)r)) t_pred_us += osc_t0((uint8_t)r);
+            double f_pred = (t_pred_us > 0.0) ? 1e6 / t_pred_us : 0.0;
             // OSC confirmation where the loop is genuinely informative: above
             // the ISR-latency floor yet below the point where the fixed per-edge
             // delay erases the capacitive signal (upper bound), and not so low
@@ -1376,13 +1526,26 @@ static fusion_t measure_capacitance_autoranged(void)
         }
     }
 
+    // Safety net: a valid, plausible probe is a real measurement — never
+    // discard it just because predictive range selection failed to nominate
+    // its range (e.g. an un-tared range or a DUT at the edge of the OSC band).
+    if (!osc_added && probe.valid && probe.plausible &&
+        probe.capacitance_f > 0.0 && n < MAX_SAMPLES) {
+        samples[n++] = probe;
+        osc_added = true;
+        osc_best_range = (int)probe.range_idx;
+    }
+
     // Neighbouring-range oscillator run for cross-validation when time permits.
     if (osc_added && osc_best_range >= 0 && n < MAX_SAMPLES) {
         int alt = (osc_best_range > 0) ? osc_best_range - 1 : osc_best_range + 1;
         if (alt >= 0 && alt < RANGE_COUNT) {
-            double f_alt = have_rough && rough_c > 0.0
-                               ? 1.0 / (osc_k((uint8_t)alt) * RANGES[alt].resistance_ohms * rough_c)
-                               : 0.0;
+            double f_alt = 0.0;
+            if (have_rough && rough_c > 0.0) {
+                double t_alt_us = osc_k((uint8_t)alt) * RANGES[alt].resistance_ohms * rough_c * 1e6;
+                if (osc_has_t0((uint8_t)alt)) t_alt_us += osc_t0((uint8_t)alt);
+                if (t_alt_us > 0.0) f_alt = 1e6 / t_alt_us;
+            }
             if (f_alt >= 100.0 && f_alt <= 15000.0) {
                 g_phase = "osc-x";
                 sample_t o2 = measure_osc_range((uint8_t)alt);
@@ -1394,6 +1557,29 @@ static fusion_t measure_capacitance_autoranged(void)
     g_phase = "fuse";
     fusion_t result = fuse_samples(samples, n);
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// Locked-range measurement (normal mode 'range <n>')
+// ---------------------------------------------------------------------------
+// Measures only the selected range with both available methods and fuses the
+// result.  The ADC's own τ gate still rejects sub-nF DUTs, so a locked pF range
+// naturally ends up oscillator-only.
+static fusion_t measure_locked_range(uint8_t range_idx)
+{
+    static sample_t samples[MAX_SAMPLES];
+    int n = 0;
+
+    g_phase = "lock-osc";
+    sample_t o = measure_osc_range(range_idx);
+    if (o.valid) samples[n++] = o;
+
+    g_phase = "lock-adc";
+    sample_t a = measure_adc_range(range_idx);
+    if (a.valid) samples[n++] = a;
+
+    g_phase = "fuse";
+    return fuse_samples(samples, n);
 }
 
 // ---------------------------------------------------------------------------
@@ -1443,10 +1629,13 @@ static void log_result(const fusion_t *f)
 }
 
 // ---------------------------------------------------------------------------
-#if OSC_DEBUG_MODE
-// ============================================================================
-//  OSC-ONLY DEBUG CONSOLE  (see OSC_DEBUG_MODE note above)
-// ============================================================================
+// Shared oscillator bring-up / calibration helpers.
+//
+// These compile in BOTH builds: the OSC debug console drives them directly,
+// while the normal autoranging firmware services them from its UART command
+// pump (console_handle_hw below), so the user can tare/calibrate while
+// measuring.  Only the two app_main() entry points remain mode-specific.
+// ---------------------------------------------------------------------------
 static volatile uint32_t dbg_edges = 0;
 static volatile uint32_t dbg_isr_calls = 0;
 
@@ -1671,9 +1860,19 @@ static void dbg_tare(int range_or_all)
 
         double acc = 0.0;
         int got = 0;
-        for (int k = 0; k < 8; ++k) {
+        double k = osc_k((uint8_t)r);
+        double r_ohm = RANGES[r].resistance_ohms;
+        for (int kk = 0; kk < 8; ++kk) {
             double f = dbg_measure_freq();
-            if (f > 0.0) { acc += 1e6 / f; got++; }
+            if (f > 0.0) {
+                acc += 1e6 / f;
+                got++;
+                // Live tare sample for the UI strip chart (running mean).
+                double mean = acc / (double)got;
+                double stray = (k * r_ohm > 0.0)
+                                   ? (mean * 1e-6) / (k * r_ohm) * 1e12 : 0.0;
+                evt_tare(r, kk, 8, f, mean, stray, 0);
+            }
             esp_task_wdt_reset();
             vTaskDelay(pdMS_TO_TICKS(10));
         }
@@ -1682,19 +1881,19 @@ static void dbg_tare(int range_or_all)
         if (got == 0) {
             printf(">> %s: no oscillation with socket empty "
                    "(range too fast / unusable for tare)\n", RANGES[r].label);
+            evt_tare(r, 8, 8, 0.0, 0.0, 0.0, 1);
             continue;
         }
         double period = acc / (double)got;
         g_osc_cal[r].t0_us = period;
         g_osc_cal[r].has_t0 = true;
         esp_err_t e = osc_cal_save();
-        double k = osc_k((uint8_t)r);
-        double r_ohm = RANGES[r].resistance_ohms;
         double stray_pf = (k * r_ohm > 0.0)
                               ? (period * 1e-6) / (k * r_ohm) * 1e12 : 0.0;
         printf(">> %s TARE: T0 = %.2f us  (implied parasitic C = %.1f pF)  %s\n",
                RANGES[r].label, period, stray_pf,
                (e == ESP_OK) ? "saved to NVS" : "NVS SAVE FAILED");
+        evt_tare(r, 8, 8, got > 0 ? 1e6 / period : 0.0, period, stray_pf, 1);
     }
 }
 
@@ -1713,6 +1912,7 @@ static void dbg_calibrate(int range_idx, const char *cmd, double ref_pf)
         g_cal_range = range_idx;
         g_cal_f1 = f;
         g_cal_ref1 = ref_c;
+        evt_calpt(range_idx, "cal1", ref_pf, f);
         printf(">> point 1 captured on %s.  Now fit a DIFFERENT reference and run 'cal2 <ref_pF>'.\n",
                RANGES[range_idx].label);
         return;
@@ -1727,11 +1927,13 @@ static void dbg_calibrate(int range_idx, const char *cmd, double ref_pf)
         double ref_c2;
         double f2 = dbg_capture_point(range_idx, ref_pf, &ref_c2);
         if (f2 <= 0.0) { g_cal_pending = false; return; }
+        evt_calpt(range_idx, "cal2", ref_pf, f2);
 
         double k, t0;
         if (!osc_cal_solve_two_point((uint8_t)range_idx,
                                      g_cal_f1, g_cal_ref1, f2, ref_c2, &k, &t0)) {
             printf(">> CAL FAILED: two-point solve rejected (refs too similar / non-physical).\n");
+            evt_calres(range_idx, "two", 0.0, 0.0, 0);
             g_cal_pending = false;
             return;
         }
@@ -1744,6 +1946,7 @@ static void dbg_calibrate(int range_idx, const char *cmd, double ref_pf)
                RANGES[range_idx].label, k, t0,
                g_cal_ref1 * 1e12, ref_c2 * 1e12,
                (e == ESP_OK) ? "saved to NVS" : "NVS SAVE FAILED");
+        evt_calres(range_idx, "two", k, t0, 1);
         g_cal_pending = false;
         return;
     }
@@ -1752,22 +1955,228 @@ static void dbg_calibrate(int range_idx, const char *cmd, double ref_pf)
     double ref_c;
     double f = dbg_capture_point(range_idx, ref_pf, &ref_c);
     if (f <= 0.0) return;
+    evt_calpt(range_idx, "cal", ref_pf, f);
     double k = osc_cal_solve_k((uint8_t)range_idx, f, ref_c);
     if (k <= 0.0) {
         printf(">> CAL FAILED: could not solve K (f=%.1f Hz).\n", f);
+        evt_calres(range_idx, "one", 0.0, 0.0, 0);
         return;
     }
     g_osc_cal[range_idx].k = k;
     g_osc_cal[range_idx].valid = true;
     esp_err_t e = osc_cal_save();
+    double held = osc_has_t0((uint8_t)range_idx) ? osc_t0((uint8_t)range_idx)
+                                                 : g_osc_cal[range_idx].delay_us;
     printf(">> %s ONE-POINT: K=%.5f (%s %.2f us)  ref=%.1f pF  %s\n",
            RANGES[range_idx].label, k,
            osc_has_t0((uint8_t)range_idx) ? "T0 held at" : "delay held at (no tare!)",
-           osc_has_t0((uint8_t)range_idx) ? osc_t0((uint8_t)range_idx)
-                                          : g_osc_cal[range_idx].delay_us,
-           ref_pf, (e == ESP_OK) ? "saved to NVS" : "NVS SAVE FAILED");
+           held, ref_pf, (e == ESP_OK) ? "saved to NVS" : "NVS SAVE FAILED");
+    evt_calres(range_idx, "one", k, held, 1);
 }
 
+// ---------------------------------------------------------------------------
+// Shared interactive console
+// ---------------------------------------------------------------------------
+static volatile bool g_in_hw_cmd = false;   // guards re-entrant exclusive cmds
+
+static void console_help(void)
+{
+    printf("Commands:\n"
+           "  help                 this list\n"
+           "  status | p           live oscillator / pin / frequency state\n"
+           "  0-3                  select range for cal/probe/status\n"
+           "  start | stop         normal mode: run / halt autoranging\n"
+           "  single               normal mode: measure one cycle then stop\n"
+           "  auto                 normal mode: autorange (undo 'range')\n"
+           "  range <0-3>          normal mode: lock a single range\n"
+           "  zero                 tare T0 with socket EMPTY (removes parasitic C)\n"
+           "  zeroall              tare every usable range\n"
+           "  cal <pF>             one-point K (uses T0 if tared)\n"
+           "  cal1 <pF> | cal2 <pF> two-point K+T0 (2 different refs)\n"
+           "  cal?                 show calibration table\n"
+           "  calclear [0-3]       reset calibration (current range or given)\n"
+           "  probe <0-3>          connectivity/charge probe of a range\n"
+           "  stream on|off        emit @@EVT JSON telemetry\n"
+           "  curve on|off         include full ADC charge curves in telemetry\n");
+}
+
+// Handle a hardware/calibration/telemetry command.  Returns true if recognised.
+static bool console_handle_hw(const char *line)
+{
+    int range_idx = g_console_range;
+
+    if (!strcmp(line, "help") || !strcmp(line, "h")) { console_help(); return true; }
+
+    if (!strcmp(line, "g")) { dbg_start(); printf(">> oscillator started\n"); return true; }
+    if (!strcmp(line, "s")) { dbg_stop();  printf(">> oscillator stopped\n"); return true; }
+    if (!strcmp(line, "r")) {
+        dbg_stop(); prepare_measurement(); dbg_start();
+        printf(">> discharged+restarted\n");
+        return true;
+    }
+
+    if (!strcmp(line, "zero"))    { dbg_tare(range_idx); return true; }
+    if (!strcmp(line, "zeroall")) { dbg_tare(-1); return true; }
+
+    if (!strncmp(line, "cal?", 4)) {
+        printf("\n--- OSC calibration ---\n");
+        for (int i = 0; i < RANGE_COUNT; ++i) {
+            printf("  %-7s K=%.5f  T0=%.2f us %-9s delay=%.2f us  %s\n",
+                   RANGES[i].label, g_osc_cal[i].k, g_osc_cal[i].t0_us,
+                   g_osc_cal[i].has_t0 ? "(tared)" : "(no tare)",
+                   g_osc_cal[i].delay_us,
+                   g_osc_cal[i].valid ? "calibrated" : "default");
+        }
+        printf("-----------------------\n\n");
+        return true;
+    }
+
+    if (!strncmp(line, "calclear", 8)) {
+        int rr = range_idx;
+        for (int i = 8; line[i]; ++i)
+            if (line[i] >= '0' && line[i] <= '3') { rr = line[i] - '0'; break; }
+        if (rr >= 0 && rr < RANGE_COUNT) {
+            g_osc_cal[rr] = (osc_cal_t){OSC_K_IDEAL, OSC_DELAY_IDEAL_US, 0.0, false, false};
+            osc_cal_save();
+            printf(">> %s calibration cleared to defaults\n", RANGES[rr].label);
+        }
+        return true;
+    }
+
+    if (!strncmp(line, "cal1", 4) || !strncmp(line, "cal2", 4)) {
+        double ref_pf = atof(line + 4);
+        if (ref_pf <= 0.0) printf(">> usage: %s <ref_pF>\n", line);
+        else dbg_calibrate(range_idx, line, ref_pf);
+        return true;
+    }
+    if (!strncmp(line, "cal", 3)) {
+        double ref_pf = atof(line + 3);
+        if (ref_pf <= 0.0) printf(">> usage: cal <ref_pF>\n");
+        else dbg_calibrate(range_idx, line, ref_pf);
+        return true;
+    }
+
+    if (!strncmp(line, "probe", 5)) {
+        int rr = range_idx;
+        for (int i = 5; line[i]; ++i)
+            if (line[i] >= '0' && line[i] <= '3') { rr = line[i] - '0'; break; }
+        dbg_probe_range(rr);
+        return true;
+    }
+
+    if (!strcmp(line, "status") || !strcmp(line, "p") || !strcmp(line, "?")) {
+        dbg_print_state(range_idx);
+        return true;
+    }
+
+    if (!strncmp(line, "stream", 6)) {
+        g_stream = (strstr(line, "on") != NULL);
+        printf(">> telemetry stream %s\n", g_stream ? "ON" : "OFF");
+        if (g_stream) evt_boot();   // resend the boot snapshot to the new client
+        return true;
+    }
+    if (!strncmp(line, "curve", 5)) {
+        g_stream_curve = (strstr(line, "on") != NULL);
+        printf(">> curve telemetry %s\n", g_stream_curve ? "ON" : "OFF");
+        return true;
+    }
+
+    if (line[0] >= '0' && line[0] <= '3' && line[1] == '\0') {
+        g_console_range = (uint8_t)(line[0] - '0');
+        select_mux_channel(RANGES[g_console_range].mux_channel);
+        printf(">> cal/probe range = %s\n", RANGES[g_console_range].label);
+        return true;
+    }
+
+    return false;
+}
+
+// True for commands that need exclusive access to the analog front-end and
+// must therefore abort an in-flight measurement before running.
+static bool is_exclusive_cmd(const char *line)
+{
+    if (!strcmp(line, "zero") || !strcmp(line, "zeroall")) return true;
+    if (!strncmp(line, "calclear", 8)) return true;
+    if (!strncmp(line, "probe", 5)) return true;
+    if (!strncmp(line, "cal", 3) && strncmp(line, "cal?", 4) != 0) return true;
+    return false;
+}
+
+// Decide immediate vs deferred execution for one parsed line.
+static void console_dispatch(const char *line)
+{
+    if (g_in_hw_cmd) return;   // busy running an exclusive command
+
+    if (!strcmp(line, "start")) { g_run = true; g_single_shot = false; evt_ack("start", 1, "running"); return; }
+    if (!strcmp(line, "stop"))  { g_run = false; evt_ack("stop", 1, "stopped"); return; }
+    if (!strcmp(line, "single")){ g_single_shot = true; g_run = true; evt_ack("single", 1, "one cycle"); return; }
+    if (!strcmp(line, "auto"))  { g_range_lock = -1; evt_ack("auto", 1, "autorange"); return; }
+    if (!strncmp(line, "range", 5)) {
+        int rr = g_console_range;
+        for (int i = 5; line[i]; ++i)
+            if (line[i] >= '0' && line[i] <= '3') { rr = line[i] - '0'; break; }
+        g_range_lock = rr;
+        g_console_range = (uint8_t)rr;
+        select_mux_channel(RANGES[rr].mux_channel);
+        printf(">> range locked to %s\n", RANGES[rr].label);
+        evt_ack("range", 1, RANGES[rr].label);
+        return;
+    }
+
+    if (is_exclusive_cmd(line)) {
+        if (g_measuring) {
+            strncpy(g_pending_cmd, line, sizeof(g_pending_cmd) - 1);
+            g_pending_cmd[sizeof(g_pending_cmd) - 1] = '\0';
+            g_abort_cycle = true;          // stop the cycle at its next safe point
+        } else {
+            g_in_hw_cmd = true;
+            console_handle_hw(line);
+            g_in_hw_cmd = false;
+        }
+        return;
+    }
+
+    if (!console_handle_hw(line)) {
+        printf(">> unknown '%s' (h for help)\n", line);
+    }
+}
+
+// Non-blocking UART poll: accumulate a line, dispatch on '\n'.
+static void service_console(void)
+{
+    static char line[64];
+    static int li = 0;
+    uint8_t b[1];
+    while (uart_read_bytes(UART_NUM_0, b, 1, 0) > 0) {
+        char c = (char)b[0];
+        if (c == '\r') continue;
+        if (c != '\n') {
+            if (li < (int)sizeof(line) - 1) line[li++] = c;
+            continue;
+        }
+        line[li] = '\0';
+        li = 0;
+        if (line[0]) console_dispatch(line);
+    }
+}
+
+// Delay that stays console-aware: services UART and returns early on abort.
+static void safe_delay_ms(uint32_t ms)
+{
+    int64_t end = esp_timer_get_time() + (int64_t)ms * 1000;
+    while (esp_timer_get_time() < end) {
+        service_console();
+        if (g_abort_cycle) return;
+        esp_task_wdt_reset();
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+// ---------------------------------------------------------------------------
+#if OSC_DEBUG_MODE
+// ============================================================================
+//  OSC-ONLY DEBUG CONSOLE  (see OSC_DEBUG_MODE note above)
+// ============================================================================
 void app_main(void)
 {
     // NVS is required to persist the per-range oscillator calibration.
@@ -1817,17 +2226,17 @@ void app_main(void)
         if (line[0] == '\0') continue;
 
         if (line[0] >= '0' && line[0] <= '3' && line[1] == '\0') {
-            range_idx = line[0] - '0';
+            g_console_range = (uint8_t)(line[0] - '0');
             bool was = osc_running;
             dbg_stop();
-            select_mux_channel(RANGES[range_idx].mux_channel);
-            printf(">> range=%s (K=%.5f %s=%.2fus %s%s)\n", RANGES[range_idx].label,
-                   osc_k((uint8_t)range_idx),
-                   osc_has_t0((uint8_t)range_idx) ? "T0" : "delay",
-                   osc_has_t0((uint8_t)range_idx) ? osc_t0((uint8_t)range_idx)
-                                                  : osc_delay((uint8_t)range_idx),
-                   g_osc_cal[range_idx].valid ? "cal" : "default",
-                   osc_has_t0((uint8_t)range_idx) ? " tared" : "");
+            select_mux_channel(RANGES[g_console_range].mux_channel);
+            printf(">> range=%s (K=%.5f %s=%.2fus %s%s)\n", RANGES[g_console_range].label,
+                   osc_k(g_console_range),
+                   osc_has_t0(g_console_range) ? "T0" : "delay",
+                   osc_has_t0(g_console_range) ? osc_t0(g_console_range)
+                                               : osc_delay(g_console_range),
+                   g_osc_cal[g_console_range].valid ? "cal" : "default",
+                   osc_has_t0(g_console_range) ? " tared" : "");
             if (was) dbg_start();
         } else if (!strcmp(line, "g")) {
             dbg_start(); printf(">> STARTED (drive=%d)\n", gpio_get_level(DRIVE_PIN));
@@ -1836,53 +2245,8 @@ void app_main(void)
         } else if (!strcmp(line, "r")) {
             dbg_stop(); prepare_measurement(); dbg_start();
             printf(">> discharged+restarted\n");
-        } else if (!strcmp(line, "p") || !strcmp(line, "?")) {
-            dbg_print_state(range_idx);
-        } else if (!strncmp(line, "probe", 5)) {
-            // Accept "probe3", "probe 3", "probe  3" etc.: scan for the first
-            // digit anywhere after the "probe" keyword.
-            int rr = range_idx;
-            for (int i = 5; line[i] != '\0'; ++i) {
-                if (line[i] >= '0' && line[i] <= '3') { rr = line[i] - '0'; break; }
-            }
-            dbg_probe_range(rr);
-        } else if (!strcmp(line, "zero")) {
-            dbg_tare(range_idx);
-        } else if (!strcmp(line, "zeroall")) {
-            dbg_tare(-1);
-        } else if (!strncmp(line, "cal?", 4)) {
-            printf("\n--- OSC calibration ---\n");
-            for (int i = 0; i < RANGE_COUNT; ++i) {
-                printf("  %-7s K=%.5f  T0=%.2f us %-9s delay=%.2f us  %s\n",
-                       RANGES[i].label, g_osc_cal[i].k, g_osc_cal[i].t0_us,
-                       g_osc_cal[i].has_t0 ? "(tared)" : "(no tare)",
-                       g_osc_cal[i].delay_us,
-                       g_osc_cal[i].valid ? "calibrated" : "default");
-            }
-            printf("-----------------------\n\n");
-        } else if (!strncmp(line, "cal1", 4) || !strncmp(line, "cal2", 4)) {
-            double ref_pf = atof(line + 4);
-            if (ref_pf <= 0.0) {
-                printf(">> usage: %s <ref_pF>\n", line);
-            } else {
-                dbg_calibrate(range_idx, line, ref_pf);
-            }
-        } else if (!strncmp(line, "cal", 3)) {
-            double ref_pf = atof(line + 3);
-            if (ref_pf <= 0.0) {
-                printf(">> usage: cal <ref_pF>   (one-point K; or cal1/cal2 for two-point K+delay)\n");
-            } else {
-                dbg_calibrate(range_idx, line, ref_pf);
-            }
-        } else if (!strcmp(line, "h")) {
-            printf("0-3 range | g start | s stop | r restart | p state\n"
-                   "probe <0-3>  connectivity test: drive node + watch V_cap charge\n"
-                   "zero  tare T0 with socket EMPTY (removes parasitic C) | zeroall all ranges\n"
-                   "cal <pF>  one-point K (uses T0 if tared)\n"
-                   "cal1 <pF> then cal2 <pF>  two-point K+T0 (use 2 different refs)\n"
-                   "cal? show table | h help\n");
         } else {
-            printf(">> unknown '%s' (h for help)\n", line);
+            console_dispatch(line);
         }
     }
 }
@@ -1901,7 +2265,12 @@ void app_main(void)
 
     system_hw_init();
     osc_cal_load();
-    ESP_LOGI(TAG, "ESP32 fusion capacitance meter ready (multi-range ADC + OSC)");
+
+    // Interactive command pump on UART0 — the same console the debug build uses,
+    // so normal mode can tare/calibrate while autoranging.
+    uart_driver_install(UART_NUM_0, 1024, 0, 0, NULL, 0);
+
+    ESP_LOGI(TAG, "ESP32 fusion capacitance meter ready (interactive autoranging)");
     for (int i = 0; i < RANGE_COUNT; ++i) {
         if (g_osc_cal[i].valid || g_osc_cal[i].has_t0) {
             ESP_LOGI(TAG, "  %s: K=%.5f %s=%.2f us (%s%s)",
@@ -1912,6 +2281,10 @@ void app_main(void)
                      g_osc_cal[i].has_t0 ? ", tared" : "");
         }
     }
+    printf("\n=== CAP METER (normal mode) ===\n"
+           "Autoranging by default. Type 'h' for commands: start/stop/single, "
+           "range/auto, zero/zeroall, cal/cal1/cal2, probe, stream/curve.\n"
+           "Enable machine telemetry with 'stream on' (append 'curve on' for ADC curves).\n\n");
 
     // A full measurement cycle can take tens of seconds (large DUTs on the
     // high-resistance ranges), so add the main task to the task watchdog with
@@ -1925,10 +2298,44 @@ void app_main(void)
     esp_task_wdt_add(NULL); // subscribe the current (main) task
 
     while (true) {
-        fusion_t result = measure_capacitance_autoranged();
+        service_console();
+
+        // Run a deferred exclusive command that was queued mid-cycle.
+        if (g_pending_cmd[0] != '\0') {
+            char line[64];
+            strncpy(line, g_pending_cmd, sizeof(line) - 1);
+            line[sizeof(line) - 1] = '\0';
+            g_pending_cmd[0] = '\0';
+            g_abort_cycle = false;
+            g_in_hw_cmd = true;
+            console_handle_hw(line);
+            g_in_hw_cmd = false;
+            continue;
+        }
+
+        if (!g_run) {
+            safe_delay_ms(100);
+            continue;
+        }
+
+        g_phase = "auto";
+        g_measuring = true;
+        fusion_t result = (g_range_lock >= 0)
+                              ? measure_locked_range((uint8_t)g_range_lock)
+                              : measure_capacitance_autoranged();
+        g_measuring = false;
+
+        if (g_abort_cycle) {   // an exclusive command cut this cycle short
+            g_abort_cycle = false;
+            continue;
+        }
+
         log_result(&result);
-        esp_task_wdt_reset();
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        evt_cycle(&result);
+
+        if (g_single_shot) { g_single_shot = false; g_run = false; }
+
+        safe_delay_ms(1000);
     }
 }
 #endif // OSC_DEBUG_MODE

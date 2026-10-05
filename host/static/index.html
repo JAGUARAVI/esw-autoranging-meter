@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ESWCap — Capacitance Dashboard</title>
+<link rel="stylesheet" href="/static/vendor/uPlot.min.css" />
+<link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+<header>
+  <h1>ESWCap <span class="sub">autoranging capacitance meter</span></h1>
+  <div class="status">
+    <span id="link" class="pill off">connecting…</span>
+    <span id="port" class="mono dim">—</span>
+    <a class="btn small" href="/api/export.csv">Export CSV</a>
+  </div>
+</header>
+
+<section class="readout">
+  <div class="big">
+    <div class="label">Capacitance</div>
+    <div id="capValue" class="value mono">—</div>
+    <div id="capMeta" class="meta dim">waiting for telemetry…</div>
+  </div>
+  <div class="stats">
+    <div class="stat"><div class="k">Confidence</div><div id="conf" class="v mono">—</div></div>
+    <div class="stat"><div class="k">Spread</div><div id="spread" class="v mono">—</div></div>
+    <div class="stat"><div class="k">ADC estimate</div><div id="adcEst" class="v mono">—</div></div>
+    <div class="stat"><div class="k">OSC estimate</div><div id="oscEst" class="v mono">—</div></div>
+    <div class="stat"><div class="k">Samples</div><div id="nsamp" class="v mono">—</div></div>
+  </div>
+</section>
+<div id="mismatch" class="warn hidden">ADC and OSC disagree beyond uncertainty — inspect DUT / re-run calibration.</div>
+
+<section class="controls">
+  <div class="group">
+    <span class="glabel">Measurement</span>
+    <button class="btn" id="btnStart">Start</button>
+    <button class="btn" id="btnStop">Stop</button>
+    <button class="btn" id="btnSingle">Single</button>
+    <select id="mode" class="btn">
+      <option value="-1">Autorange</option>
+      <option value="0">Lock 100 Ω</option>
+      <option value="1">Lock 1 kΩ</option>
+      <option value="2">Lock 100 kΩ</option>
+      <option value="3">Lock 1 MΩ</option>
+    </select>
+  </div>
+  <div class="group">
+    <span class="glabel">Streaming</span>
+    <label class="chk"><input type="checkbox" id="curveChk" /> ADC curves</label>
+  </div>
+  <div class="group">
+    <span class="glabel">Auto range sweep</span>
+    <span id="rangePills" class="pills"></span>
+  </div>
+</section>
+
+<section class="grid">
+  <div class="card wide">
+    <h2>Capacitance vs time <span class="dim">(log, pF)</span></h2>
+    <div id="capChart" class="plot"></div>
+  </div>
+
+  <div class="card">
+    <h2>Sample spread <span class="dim">(% of median)</span></h2>
+    <div id="spreadChart" class="plot"></div>
+  </div>
+
+  <div class="card">
+    <h2>Oscillator frequency <span class="dim">(Hz, per range)</span></h2>
+    <div id="freqChart" class="plot"></div>
+  </div>
+
+  <div class="card">
+    <h2>ADC τ <span class="dim">(µs, per range)</span></h2>
+    <div id="tauChart" class="plot"></div>
+  </div>
+
+  <div class="card wide">
+    <h2>ADC charge curve <span class="dim">V(t) + fitted exponential</span></h2>
+    <div id="curveChart" class="plot"></div>
+    <div id="curveMeta" class="meta dim">waiting for an ADC curve…</div>
+  </div>
+
+  <div class="card">
+    <h2>Calibration curve <span class="dim">T vs C_ref</span></h2>
+    <div id="calChart" class="plot"></div>
+    <div id="calMeta" class="meta dim">no captured points</div>
+  </div>
+
+  <div class="card">
+    <h2>Tare stability <span class="dim">T0 (µs, per range)</span></h2>
+    <div id="tareChart" class="plot"></div>
+  </div>
+</section>
+
+<section class="grid two">
+  <div class="card">
+    <h2>Calibration</h2>
+    <div class="calrow">
+      <label>Target range</label>
+      <select id="calRange">
+        <option value="0">100 Ω</option>
+        <option value="1">1 kΩ</option>
+        <option value="2" selected>100 kΩ</option>
+        <option value="3">1 MΩ</option>
+      </select>
+    </div>
+    <div class="calrow">
+      <button class="btn" id="btnTare">Tare (socket empty)</button>
+      <button class="btn" id="btnTareAll">Tare all</button>
+      <button class="btn ghost" id="btnCalTable">Show table</button>
+      <button class="btn ghost" id="btnCalClear">Clear</button>
+    </div>
+    <hr />
+    <div class="calrow">
+      <label>One-point ref</label>
+      <input id="ref1" class="mono" type="number" step="any" placeholder="pF" />
+      <button class="btn" id="btnCal1p">Cal K</button>
+    </div>
+    <div class="calrow">
+      <label>Two-point</label>
+      <input id="refA" class="mono" type="number" step="any" placeholder="ref1 pF" />
+      <button class="btn" id="btnCalA">Capture 1</button>
+    </div>
+    <div class="calrow">
+      <label>then</label>
+      <input id="refB" class="mono" type="number" step="any" placeholder="ref2 pF" />
+      <button class="btn" id="btnCalB">Capture 2 (solve)</button>
+    </div>
+    <div class="hint dim">Tare removes the ~136 pF parasitic node capacitance. Two-point solves K and T0 together.</div>
+    <div id="calTable" class="caltable mono"></div>
+  </div>
+
+  <div class="card">
+    <h2>Current cycle samples</h2>
+    <div class="tablewrap">
+      <table id="sampleTable">
+        <thead><tr><th>Range</th><th>Method</th><th>Valid</th><th>C</th><th>q</th><th>T / τ</th><th>f / R²</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section class="card">
+  <h2>Command console &amp; log</h2>
+  <div class="console">
+    <input id="cmdInput" class="mono" placeholder="type a firmware command (h for help)…" autocomplete="off" />
+    <button class="btn" id="btnSend">Send</button>
+  </div>
+  <pre id="log" class="log mono"></pre>
+</section>
+
+<script src="/static/vendor/uPlot.iife.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

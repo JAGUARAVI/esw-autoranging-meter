@@ -54,7 +54,34 @@ The ADC is now hard-gated below ~1 nF (`ADC_SUBNF_GATE_F`): a 10 pF change on
 the 1 MΩ range is only ~10 µs of τ, below the sample-loop jitter, so small DUTs
 are measured by the tared oscillator only.
 
-## 5. Pending Action Items & Validation Required
+## 5. Interactive Normal Mode & Web Dashboard
+
+Normal mode (the default build, `OSC_DEBUG_MODE 0`) is now interactive as well
+as autoranging. It installs a UART0 driver, runs a cooperative command pump, and
+keeps measuring by default. Exclusive commands (`zero`, `cal*`, `probe`) abort
+the in-flight cycle at the next safe point and then run.
+
+Commands (type `h`): `start/stop/single`, `auto`, `range <0-3>`, `zero`,
+`zeroall`, `cal <pF>`, `cal1/cal2 <pF>`, `cal?`, `calclear`, `probe <0-3>`,
+`status`, `stream on|off`, `curve on|off`.
+
+Telemetry: with `stream on` the firmware prints single-line JSON after a
+`@@EVT ` sentinel (`boot`, `cycle`, `sample`, `curve`, `tare`, `calpt`,
+`calres`, `ack`); `curve on` adds the full ADC charge curve. Human `ESP_LOG`
+lines are emitted alongside and are unaffected.
+
+A local web dashboard lives in `host/` (FastAPI + WebSocket + vendored uPlot):
+
+```bash
+host/run.sh          # autodetects /dev/ttyACM*; open http://127.0.0.1:8000
+```
+
+It owns the serial port, renders live capacitance/spread/frequency/τ/curve/
+calibration/tare charts (fed only by real telemetry), and exposes the
+calibration commands plus a raw command console and CSV export. See
+`host/README.md`.
+
+## 6. Pending Action Items & Validation Required
 
 * **Tune Oscillator K-Factor:** Still needs the two-point `cal1`/`cal2` run
   described in §4 with 1% C0G/NP0 references (e.g. 100 pF, 1 nF) to set the
