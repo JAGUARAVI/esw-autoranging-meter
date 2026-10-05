@@ -43,6 +43,24 @@ Every chart is fed only by real firmware telemetry — nothing is synthesised.
 | Calibration T vs C_ref | `calpt` / `calres` | `ref_pf`, `period_us`, `k`, `t0_us` |
 | Tare stability (T0 per range) | `tare` | `period_us`, `t0_us` |
 | Current-cycle samples table | `sample` | full `sample_t` |
+| Front-end state badge + SSR bits | `fe` | `state`, `ssr13`, `ssr2`, `drive`, `charged`, `discharged` |
+| Confirmation toasts | `ack` | `cmd`, `ok`, `msg` |
+
+## Front-end safety controls
+
+The device **boots IDLE** — nothing is started or charged until you ask. The
+dashboard's front-end panel shows the live state and has separate power
+controls (these are independent of Start/Stop):
+
+- **Pre-charge** — SSR1 (V_BIAS→10 Ω→N_DUT) + SSR3 (V_cap→1 Ω→GND, shared GPIO)
+  charge C_block/N_DUT. It asks for confirmation because up to 20 V bias is
+  applied, and the DUT stays biased after charging. Do not touch/remove the DUT.
+- **Discharge** — SSR2 (N_DUT→100 Ω→GND) bleeds DUT/C_block, then all SSRs off.
+- **Idle** — turn all SSRs off without discharging (asks for confirmation).
+
+Every front-end command **first stops any in-flight measurement cycle** so the
+SSR state machine can never be driven concurrently with a measurement. The UI
+shows a red warning whenever the DUT is charged or idle-but-possibly-biased.
 
 ## Calibration workflow
 

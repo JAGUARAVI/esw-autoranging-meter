@@ -61,9 +61,18 @@ as autoranging. It installs a UART0 driver, runs a cooperative command pump, and
 keeps measuring by default. Exclusive commands (`zero`, `cal*`, `probe`) abort
 the in-flight cycle at the next safe point and then run.
 
-Commands (type `h`): `start/stop/single`, `auto`, `range <0-3>`, `zero`,
-`zeroall`, `cal <pF>`, `cal1/cal2 <pF>`, `cal?`, `calclear`, `probe <0-3>`,
-`status`, `stream on|off`, `curve on|off`.
+Commands (type `h`): `start/stop/single`, `precharge`, `discharge`, `idle`,
+`auto`, `range <0-3>`, `zero`, `zeroall`, `cal <pF>`, `cal1/cal2 <pF>`, `cal?`,
+`calclear`, `probe <0-3>`, `status`, `stream on|off`, `curve on|off`.
+
+Front-end power is deliberately **not** tied to `start`/`stop`. `start`/`stop`
+only gate autoranging; `precharge`/`discharge`/`idle` drive the SSRs. Every
+front-end command is exclusive: it aborts any in-flight cycle first, so the SSR
+state machine can never be driven concurrently with a measurement. The device
+**boots IDLE** (`g_run = false`) — it does not measure or charge until
+instructed. SSR1 (pre-charge) and SSR3 (V_cap clamp) share one GPIO, so charging
+always clamps V_cap. The firmware emits `@@EVT {"t":"fe",...}` with the state,
+SSR pin levels and `charged`/`discharged` flags for the dashboard.
 
 Telemetry: with `stream on` the firmware prints single-line JSON after a
 `@@EVT ` sentinel (`boot`, `cycle`, `sample`, `curve`, `tare`, `calpt`,

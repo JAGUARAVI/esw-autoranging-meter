@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+  <meta charset="UTF-8">
+<!-- This site is hosted on Netlify. Anyone can build and deploy a site
+     like this one for free: https://netlify.new/?utm_campaign=loops&utm_source=ai-legible&utm_medium=owned&utm_content=comment&utm_id=d94e0f8a-95a6-4314-9719-98228a6858d0
+     Netlify hosting facts for this site: static/SSR served via Netlify Edge. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>STM32 Dual-Mode Capacitance Analyzer — Interactive Circuit</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com/">
+  <link rel="preconnect" href="https://fonts.gstatic.com/" crossorigin="">
+  <link href="STM32%20Dual-Mode%20Capacitance%20Analyzer%20%E2%80%94%20Interactive%20Circuit_files/css2.css" rel="stylesheet">
+  <link rel="stylesheet" href="STM32%20Dual-Mode%20Capacitance%20Analyzer%20%E2%80%94%20Interactive%20Circuit_files/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap topbar-inner">
+      <div class="brand">
+        <div class="logo">C</div>
+        <div>
+          <h1>Capacitance Analyzer</h1>
+          <small>STM32G431 · Dual Mode · 0–20 V Bias</small>
+        </div>
+      </div>
+      <nav class="nav">
+        <a href="#overview">Overview</a>
+        <a href="#architecture">Architecture</a>
+        <a href="#schematic">Schematic</a>
+        <a href="#lab">Lab</a>
+        <a href="#modes">Modes</a>
+        <a href="#theory">Theory</a>
+        <a href="#pins">Pins</a>
+        <a href="#bom">BOM</a>
+        <a href="#sequence">Sequence</a>
+      </nav>
+    </div>
+  </header>
+
+  <section class="hero" id="overview">
+    <div class="wrap hero-grid">
+      <div>
+        <div class="kicker">Project instrument · interactive reference</div>
+        <h2>Measure capacitors<br>from picofarads to millifarads,<br>under programmable DC bias.</h2>
+        <p class="lede">
+          One STM32G431CBU6 drives two measurement physics: a relaxation oscillator for small ceramics,
+          and RC step-response tracking for large electrolytics. A PhotoMOS safety bank and a 1000 µF
+          blocking capacitor let you inject 0–20 V DC bias without destroying the MCU pins.
+        </p>
+        <div class="stats">
+          <div class="stat"><b>1 pF – 1000 µF</b><span>usable span, auto-ranged</span></div>
+          <div class="stat"><b>0 – 20 V</b><span>programmable DC bias</span></div>
+          <div class="stat"><b>2 modes</b><span>oscillator + RC step</span></div>
+          <div class="stat"><b>3 SSRs</b><span>pre-charge · clamp · discharge</span></div>
+        </div>
+      </div>
+      <aside class="panel hero-side">
+        <span class="br"></span><span class="bl"></span>
+        <div class="kicker">How to read this page</div>
+        <div class="mode-pills">
+          <span class="pill on">Click a block</span>
+          <span class="pill">Click a part</span>
+          <span class="pill">Run the lab</span>
+        </div>
+        <p>Every box, net and BOM line is live. The schematic inspector explains <em>why</em> the part is there, not just what it is.</p>
+        <ol class="seq">
+          <li><span class="num">1</span><span>Boost a 18650 cell to ~20 V, then linearly regulate it with the DAC.</span></li>
+          <li><span class="num">2</span><span>Pre-charge the DUT while clamping V<sub>cap</sub> to ground.</span></li>
+          <li><span class="num">3</span><span>Measure with oscillator or RC-step through C<sub>block</sub>.</span></li>
+          <li><span class="num">4</span><span>Discharge safely before the next part.</span></li>
+        </ol>
+      </aside>
+    </div>
+  </section>
+
+  <section id="architecture">
+    <div class="wrap">
+      <div class="sec-head">
+        <div class="kicker">01 · Signal path</div>
+        <h2>Six blocks, one instrument</h2>
+        <p class="lede">Click any block to jump into its schematic and part list. High voltage stays on the DUT side of C<sub>block</sub>. The STM32 only ever sees 0–3.3 V.</p>
+      </div>
+      <div class="arch" id="arch-cards">
+    <div class="arch-card" data-id="mt3608">
+      <div class="tag">PWR</div>
+      <h3>Boost</h3>
+      <p>18650 → MT3608 → ~20 V raw rail.</p>
+    </div>
+    <div class="arch-card" data-id="lm358">
+      <div class="tag">BIAS</div>
+      <h3>0–20 V linear</h3>
+      <p>DAC × 6.0 through LM358 + TIP122, 65 mA limit.</p>
+    </div>
+    <div class="arch-card" data-id="ssr1">
+      <div class="tag">SAFE</div>
+      <h3>PhotoMOS bank</h3>
+      <p>Pre-charge, clamp and discharge. PB10 is the interlock.</p>
+    </div>
+    <div class="arch-card" data-id="cblock">
+      <div class="tag">ISO</div>
+      <h3>C_block</h3>
+      <p>1000 µF ∥ 100 nF. DC dies here. AC passes.</p>
+    </div>
+    <div class="arch-card" data-id="mux">
+      <div class="tag">RANGE</div>
+      <h3>Buffered MUX</h3>
+      <p>SN74LVC1G34 + TMUX1104 + 100k / 1k / 100.</p>
+    </div>
+    <div class="arch-card" data-id="stm32">
+      <div class="tag">MCU</div>
+      <h3>STM32G431</h3>
+      <p>DAC, ADC, COMP1, TIM2. The closed loop.</p>
+    </div></div>
+    </div>
+  </section>
+
+  <section id="schematic">
+    <div class="wrap">
+      <div class="sec-head">
+        <div class="kicker">02 · Interactive schematic</div>
+        <h2>Circuit, explorable</h2>
+        <p class="lede">Switch sheets, highlight operating modes, or start the guided tour. Click any component for role, formula and pin connections.</p>
+      </div>
+      <div class="work">
+        <div class="panel">
+          <span class="br"></span><span class="bl"></span>
+          <div class="toolbar" id="toolbar">
+      <button class="btn " data-sheet="sys">System</button>
+      <button class="btn " data-sheet="bias">Bias supply</button>
+      <button class="btn active" data-sheet="front">Front-end</button>
+      <div class="sep"></div>
+      <button class="btn active" data-mode="idle">idle</button><button class="btn " data-mode="precharge">precharge</button><button class="btn " data-mode="osc">osc</button><button class="btn " data-mode="rc">rc</button><button class="btn " data-mode="discharge">discharge</button>
+      <div class="sep"></div>
+      <button class="btn ghost" id="btn-tour">Guided tour</button>
+      <button class="btn ghost" id="btn-reset">Reset view</button>
+    </div>
+          <div class="sch-frame" id="sch-frame">
+            <div class="hint">Scroll to zoom · drag to pan · click a part</div>
+          <svg viewBox="0 0 1600 980" class="sch" preserveAspectRatio="xMidYMid meet" style="transform-origin: 0px 0px 0px; transform: translate(-665.4px, -175.2px) scale(1.77279);"><filter id="glow"><feGaussianBlur stdDeviation="2.2" result="b"></feGaussianBlur><feMerge><feMergeNode in="b"></feMergeNode><feMergeNode in="SourceGraphic"></feMergeNode></feMerge></filter><g class="wires"><path d="M40 90 H1560" class="w hv" data-net="vbias" fill="none"></path><path d="M40 950 H1560" class="w gnd" data-net="" fill="none"></path><path d="M520 150 V500" class="w hv" data-net="ndut" fill="none"></path><path d="M470 90 H520 V90" class="w hv" data-net="" fill="none"></path><path d="M470 210 V150 H520" class="w hv" data-net="ndut" fill="none"></path><path d="M60 200 V170 H130" class="w hv" data-net="" fill="none"></path><path d="M320 118 H520" class="w hv" data-net="ndut" fill="none"></path><path d="M196 188 V220" class="w gnd" data-net="" fill="none"></path><path d="M210 318 H520" class="w hv" data-net="ndut" fill="none"></path><path d="M20 370 V470 H130" class="w gnd" data-net="" fill="none"></path><path d="M130 600 V950" class="w gnd" data-net="" fill="none"></path><path d="M86 388 V420" class="w gnd" data-net="" fill="none"></path><path d="M520 548 V950" class="w gnd" data-net="" fill="none"></path><path d="M520 430 H560" class="w analog" data-net="ndut" fill="none"></path><path d="M520 430 V350 H560" class="w analog" data-net="" fill="none"></path><path d="M588 430 H620" class="w analog" data-net="vcap" fill="none"></path><path d="M588 350 H620 V430" class="w analog" data-net="" fill="none"></path><path d="M620 430 H1180" class="w analog" data-net="vcap" fill="none"></path><path d="M985 334 V430" class="w analog" data-net="vcap" fill="none"></path><path d="M900 270 H840 V90" class="w vdd" data-net="" fill="none"></path><path d="M1070 292 H1120 V950" class="w gnd" data-net="" fill="none"></path><path d="M870 518 H920 V430" class="w analog" data-net="vcap" fill="none"></path><path d="M680 570 V588" class="w gnd" data-net="" fill="none"></path><path d="M680 708 V950" class="w gnd" data-net="" fill="none"></path><path d="M746 588 V620" class="w gnd" data-net="" fill="none"></path><path d="M1180 430 V278 H1240" class="w analog" data-net="vcap" fill="none"></path><path d="M1180 430 V358 H1240" class="w analog" data-net="" fill="none"></path><path d="M220 782 H280" class="w drive" data-net="drive" fill="none"></path><path d="M470 782 H520" class="w drive" data-net="drive" fill="none"></path><path d="M740 782 H800" class="w drive" data-net="" fill="none"></path><path d="M740 782 V700 H800" class="w drive" data-net="" fill="none"></path><path d="M740 782 V750 H800" class="w drive" data-net="" fill="none"></path><path d="M740 782 V800 H800" class="w drive" data-net="" fill="none"></path><path d="M970 700 H1000 V430" class="w analog" data-net="vcap" fill="none"></path><path d="M970 750 H1060 V430" class="w analog" data-net="" fill="none"></path><path d="M970 800 H1120 V430" class="w analog" data-net="" fill="none"></path></g><g class="parts"><text x="40" y="34" class="sheet-title">SHEET 2  ·  MEASUREMENT &amp; SAFETY FRONT-END</text><text x="40" y="56" class="note">PB10 fires SSR1 AND SSR3 together  ·  C_block is the DC fire-wall  ·  V_cap is the only node the MCU touches</text><text x="40" y="84" class="rail-lbl">V_BIAS</text><text x="545" y="165" class="rail-lbl">N_DUT</text><g class="part" data-id="rbias"><path d="M470 90 v10" class="w"></path><rect x="462" y="100" width="16" height="100" class="body"></rect><path d="M470 200 v10" class="w"></path><text x="484" y="150" class="lbl-sm">1 MΩ</text></g><circle cx="470" cy="90" r="2.4" class="dot"></circle><circle cx="520" cy="150" r="2.4" class="dot"></circle><text x="388" y="130" class="pin-lbl">R_bias 1 MΩ</text><g class="part" data-id="ssr1"><rect x="150" y="100" width="150" height="88" rx="5" class="body"></rect><text x="160" y="122" class="title">SSR1 PRE-CHARGE</text><text x="160" y="140" class="box-sub">AQY212 PhotoMOS</text><text x="160" y="160" class="lbl-sm">PB10 via 330 Ω</text><text x="134" y="174" class="pin-lbl">4</text><text x="306" y="124" class="pin-lbl">3</text><text x="168" y="204" class="pin-lbl">1</text><text x="196" y="204" class="pin-lbl">2</text></g><path d="M150 170 H130" class="w " data-net="" fill="none"></path><path d="M300 118 H320" class="w " data-net="" fill="none"></path><g class="part" data-id="r10pre"><path d="M60 90 v10" class="w"></path><rect x="52" y="100" width="16" height="90" class="body"></rect><path d="M60 190 v10" class="w"></path><text x="74" y="145" class="lbl-sm">10 Ω</text></g><circle cx="60" cy="90" r="2.4" class="dot"></circle><circle cx="520" cy="118" r="2.4" class="dot"></circle><g class="part" data-id="r330"><path d="M168 188 v6" class="w"></path><rect x="162" y="194" width="12" height="26" class="body"></rect><path d="M168 220 v6" class="w"></path></g><text x="158" y="240" class="pin-lbl">PB10</text><text x="182" y="210" class="pin-lbl">330 Ω</text><g class="gnd-sym"><path d="M196 220 v12 M184 232 h24 M188 237 h16 M192 242 h8"></path></g><g class="part" data-id="ssr2"><rect x="40" y="300" width="150" height="88" rx="5" class="body"></rect><text x="50" y="322" class="title">SSR2 DISCHARGE</text><text x="50" y="340" class="box-sub">AQY212 PhotoMOS</text><text x="50" y="360" class="lbl-sm">PB8 via 330 Ω</text><text x="24" y="374" class="pin-lbl">4</text><text x="196" y="324" class="pin-lbl">3</text><text x="58" y="404" class="pin-lbl">1</text><text x="86" y="404" class="pin-lbl">2</text></g><path d="M40 370 H20" class="w " data-net="" fill="none"></path><path d="M190 318 H210" class="w " data-net="" fill="none"></path><circle cx="520" cy="318" r="2.4" class="dot"></circle><g class="part" data-id="r100dis"><path d="M130 470 v10" class="w"></path><rect x="122" y="480" width="16" height="110" class="body"></rect><path d="M130 590 v10" class="w"></path><text x="144" y="535" class="lbl-sm">100 Ω</text></g><g class="gnd-sym"><path d="M130 950 v12 M118 962 h24 M122 967 h16 M126 972 h8"></path></g><g class="part" data-id="r330"><path d="M58 388 v6" class="w"></path><rect x="52" y="394" width="12" height="26" class="body"></rect><path d="M58 420 v6" class="w"></path></g><text x="48" y="440" class="pin-lbl">PB8</text><text x="72" y="410" class="pin-lbl">330 Ω</text><g class="gnd-sym"><path d="M86 420 v12 M74 432 h24 M78 437 h16 M82 442 h8"></path></g><g class="part" data-id="cdut"><path d="M520 500 v10" class="w"></path><path d="M508 510 h24" class="w" stroke-width="2.2"></path><path d="M508 518 h24" class="w" stroke-width="2.2"></path><path d="M520 518 v10" class="w"></path><text x="498" y="516" class="lbl-sm">+</text><text x="536" y="518" class="lbl-sm">C_DUT (470 nF)</text></g><g class="gnd-sym"><path d="M520 950 v12 M508 962 h24 M512 967 h16 M516 972 h8"></path></g><circle cx="520" cy="500" r="2.4" class="dot"></circle><g class="part" data-id="cblock"><path d="M560 430 h10" class="w"></path><path d="M570 418 v24" class="w" stroke-width="2.2"></path><path d="M578 418 v24" class="w" stroke-width="2.2"></path><path d="M578 430 h10" class="w"></path><text x="574" y="412" class="lbl-sm"></text></g><g class="part" data-id="cnf"><path d="M560 350 h10" class="w"></path><path d="M570 338 v24" class="w" stroke-width="2.2"></path><path d="M578 338 v24" class="w" stroke-width="2.2"></path><path d="M578 350 h10" class="w"></path><text x="574" y="332" class="lbl-sm"></text></g><text x="610" y="356" class="lbl-sm">100 nF</text><text x="610" y="452" class="lbl-sm">1000 µF</text><text x="596" y="336" class="box-sub">C_block</text><circle cx="520" cy="430" r="2.4" class="dot"></circle><circle cx="620" cy="430" r="2.4" class="dot"></circle><text x="640" y="420" class="rail-lbl">V_cap</text><g class="part" data-id="bat54s"><rect x="900" y="250" width="170" height="84" rx="5" class="body"></rect><text x="912" y="272" class="title">BAT54S clamp</text><text x="912" y="290" class="box-sub">GND ← V_cap → 3.3 V</text><text x="912" y="308" class="lbl-sm">protects PA0 / PA1</text></g><circle cx="985" cy="430" r="2.4" class="dot"></circle><text x="800" y="108" class="lbl-sm">+3.3 V</text><g class="gnd-sym"><path d="M1120 950 v12 M1108 962 h24 M1112 967 h16 M1116 972 h8"></path></g><g class="part selected" data-id="ssr3"><rect x="700" y="500" width="150" height="88" rx="5" class="body"></rect><text x="710" y="522" class="title">SSR3 CLAMP</text><text x="710" y="540" class="box-sub">AQY212 PhotoMOS</text><text x="710" y="560" class="lbl-sm">PB10 via 330 Ω</text><text x="684" y="574" class="pin-lbl">4</text><text x="856" y="524" class="pin-lbl">3</text><text x="718" y="604" class="pin-lbl">1</text><text x="746" y="604" class="pin-lbl">2</text></g><path d="M700 570 H680" class="w " data-net="" fill="none"></path><path d="M850 518 H870" class="w " data-net="" fill="none"></path><circle cx="920" cy="430" r="2.4" class="dot"></circle><g class="part" data-id="r1clamp"><path d="M680 588 v10" class="w"></path><rect x="672" y="598" width="16" height="100" class="body"></rect><path d="M680 698 v10" class="w"></path><text x="694" y="648" class="lbl-sm">1 Ω</text></g><g class="gnd-sym"><path d="M680 950 v12 M668 962 h24 M672 967 h16 M676 972 h8"></path></g><g class="part" data-id="r330"><path d="M718 588 v6" class="w"></path><rect x="712" y="594" width="12" height="26" class="body"></rect><path d="M718 620 v6" class="w"></path></g><text x="708" y="640" class="pin-lbl">PB10</text><text x="732" y="610" class="pin-lbl">330 Ω</text><g class="gnd-sym"><path d="M746 620 v12 M734 632 h24 M738 637 h16 M742 642 h8"></path></g><g class="part" data-id="pa0"><rect x="1240" y="250" width="190" height="56" rx="6" class="body"></rect><text x="1252" y="272" class="title">PA0  ·  ADC1</text><text x="1252" y="290" class="box-sub">RC-step tracking</text></g><g class="part" data-id="pa1"><rect x="1240" y="330" width="190" height="56" rx="6" class="body"></rect><text x="1252" y="352" class="title">PA1  ·  COMP1</text><text x="1252" y="370" class="box-sub">oscillator sense</text></g><circle cx="1180" cy="430" r="2.4" class="dot"></circle><g class="part" data-id="stm32"><rect x="40" y="740" width="180" height="84" rx="6" class="body"></rect><text x="52" y="762" class="title">STM32  PB0</text><text x="52" y="780" class="box-sub">TIM2 / GPIO</text></g><g class="part" data-id="buf"><rect x="280" y="740" width="190" height="84" rx="6" class="body"></rect><text x="292" y="762" class="title">SN74LVC1G34</text><text x="292" y="780" class="box-sub">push-pull buffer</text></g><g class="part" data-id="mux"><rect x="520" y="720" width="220" height="128" rx="6" class="body"></rect><text x="532" y="742" class="title">TMUX1104</text><text x="532" y="760" class="box-sub">A0 A1 EN · Ron≈2Ω</text></g><g class="part" data-id="r100k"><path d="M800 700 h10" class="w"></path><rect x="810" y="692" width="150" height="16" class="body"></rect><path d="M960 700 h10" class="w"></path><text x="885" y="686" class="lbl-sm">CH1  100 kΩ</text></g><g class="part" data-id="r1k"><path d="M800 750 h10" class="w"></path><rect x="810" y="742" width="150" height="16" class="body"></rect><path d="M960 750 h10" class="w"></path><text x="885" y="736" class="lbl-sm">CH2  1 kΩ</text></g><g class="part" data-id="r100"><path d="M800 800 h10" class="w"></path><rect x="810" y="792" width="150" height="16" class="body"></rect><path d="M960 800 h10" class="w"></path><text x="885" y="786" class="lbl-sm">CH3  100 Ω</text></g><text x="800" y="848" class="lbl-sm">CH4  NC  (idle / Hi-Z)</text><circle cx="1000" cy="430" r="2.4" class="dot"></circle><circle cx="1060" cy="430" r="2.4" class="dot"></circle><circle cx="1120" cy="430" r="2.4" class="dot"></circle><text x="40" y="962" class="note">Each
+ SSR LED is driven from its GPIO through an inline 330 Ω resistor (drawn
+ on the pin-1 stub). f ≈ 0.721/(R·C) at 50 % thresholds · τ = R·C in 
+RC-step.</text></g></svg></div>
+          <div class="tourbar" id="tourbar">
+            <p id="tour-text"></p>
+            <button class="btn" id="tour-prev">Prev</button>
+            <button class="btn active" id="tour-next">Next</button>
+            <button class="btn ghost" id="tour-end">End</button>
+          </div>
+        </div>
+        <aside class="panel inspector" id="inspector">
+          <span class="br"></span><span class="bl"></span>
+          <div class="empty" id="insp-empty" hidden="">
+            <div class="kicker">Inspector</div>
+            <h3>Select a component</h3>
+            <p>Click any IC, transistor, resistor, capacitor, SSR or net
+ label on the schematic. The inspector shows the BOM line, the 
+electrical job, and the failure mode it exists to prevent.</p>
+          </div>
+          <div id="insp-body">
+      <div class="kicker">Inspector</div>
+      <div class="meta">AQY212 PhotoMOS · V_cap -- 1 Ω -- GND</div>
+      <h3>SSR3 — V_cap clamp</h3>
+      <div class="chips"><span class="chip analog">analog</span></div>
+      <p>This is the most important safety part on the analog side. PB10
+ turns it on with SSR1. The 1 Ω resistor eats the C_block inrush (Q = 
+C·ΔV ≈ 1000 µF × 20 V = 20 mC) while the BAT54S only has to catch 
+residual spikes.</p>
+      <table class="kv"><tbody><tr><th>GPIO</th><td>PB10 (wired with SSR1)</td></tr><tr><th>Series</th><td>1 Ω</td></tr><tr><th>Job</th><td>Hold V_cap at GND during pre-charge</td></tr></tbody></table>
+      <p style="margin-top:10px"><strong>Why it is here.</strong> Pre-charging N_DUT slams displacement current through C_block. Without a clamp, V_cap would jump to 20 V and destroy PA0/PA1.</p>
+      <p class="meta" style="margin-top:8px">1 × AQY212 / TLP241A</p>
+      <div class="callout ">Never enable SSR1 unless SSR3 is already on. Shared PB10 is the hardware AND of that rule.</div>
+    </div>
+        </aside>
+      </div>
+    </div>
+  </section>
+
+  <section id="lab">
+    <div class="wrap">
+      <div class="sec-head">
+        <div class="kicker">03 · Virtual bench</div>
+        <h2>Watch the physics</h2>
+        <p class="lede">Pick a capacitance, a range resistor and a mode. The scope draws the drive and V<sub>cap</sub> the STM32 actually sees. Numbers update from the same equations the firmware will use.</p>
+      </div>
+      <div class="lab-grid">
+        <div class="panel ctrl">
+          <span class="br"></span><span class="bl"></span>
+          <div class="kicker">Stimulus</div>
+          <label>Device under test</label>
+          <input type="range" id="c-slider" min="0" max="1000" value="630">
+          <div class="readout" id="c-readout"><span>468 nF</span><small>C_DUT</small></div>
+          <label>Range resistor</label>
+          <div class="row-btns" id="range-btns"><button class="btn" data-r="100">100 Ω</button><button class="btn active" data-r="100k">100 kΩ</button><button class="btn" data-r="1k">1 kΩ</button></div>
+          <label>Operating mode</label>
+          <div class="row-btns" id="mode-btns"><button class="btn active" data-m="osc">Oscillator</button><button class="btn" data-m="rc">RC step</button><button class="btn" data-m="precharge">Pre-charge</button><button class="btn" data-m="discharge">Discharge</button></div>
+          <label>DC bias (DAC)</label>
+          <input type="range" id="bias-slider" min="0" max="198" value="0">
+          <div class="readout" id="bias-readout"><span>0.0 V</span><small>V_BIAS · DAC PA5</small></div>
+          <label>Result</label>
+          <div class="readout" id="result-readout"><span>15.4 Hz</span><small>f ≈ 0.72/(RC) · C_eq 468 nF · recommend RC-step</small></div>
+        </div>
+        <div class="panel scope">
+          <span class="br"></span><span class="bl"></span>
+          <div class="legend">
+            <span><i class="sw" style="background:#5ce1ff"></i>V_cap (PA0 / PA1)</span>
+            <span><i class="sw" style="background:#f3b23a"></i>Drive (buffer out)</span>
+            <span><i class="sw" style="background:#ff8a6b"></i>N_DUT</span>
+            <span><i class="sw" style="background:#9dffb0"></i>Thresholds</span>
+          </div>
+          <canvas id="scope" width="1100" height="360"></canvas>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="modes">
+    <div class="wrap">
+      <div class="sec-head">
+        <div class="kicker">04 · Two measurement physics</div>
+        <h2>Oscillator for small C, RC step for large C</h2>
+      </div>
+      <div class="grid-2" id="mode-cards">
+    <div class="panel card"><span class="br"></span><span class="bl"></span>
+      <div class="kicker">Mode A · small C</div>
+      <h3>Relaxation oscillator</h3>
+      <p>The SN74LVC1G34 drives a square wave through the selected range
+ resistor into V_cap. COMP1 on PA1 compares V_cap with an internal 
+threshold (hysteresis via DAC or built-in). Each crossing flips PB0. The
+ period is counted by a timer.</p>
+      <div class="formula">f = 1 / [ 2 R C ln( (Vdrv − V_L) / (Vdrv − V_H) ) ]</div>
+      <p>With symmetric 50 % thresholds this collapses to <strong>f ≈ 0.721 / (R C)</strong>. Invert: <strong>C ≈ 0.721 / (R f) − C_stray</strong>.</p>
+      <p>Use 100 kΩ for pF–nF ceramics. Frequency stays roughly 70 Hz – 
+70 kHz, which TIM2 loves. COMP1 is the right sensor — the ADC sampling 
+cap would eat picofarads.</p>
+    </div>
+    <div class="panel card"><span class="br"></span><span class="bl"></span>
+      <div class="kicker">Mode B · large C</div>
+      <h3>RC step tracking</h3>
+      <p>PB0 is held high. V_cap rises as Vdrv (1 − e<sup>−t/RC</sup>). PA0 is sampled with ADC + DMA. Firmware finds τ from a 63 % point or a curve fit.</p>
+      <div class="formula">V(t) = Vdrv (1 − e<sup>−t / RC</sup>) &nbsp;⇒&nbsp; C = −t / [ R ln(1 − V/Vdrv) ]</div>
+      <p>Hand-off from oscillator when f drops below ~50 Hz (C ≳ 100 nF 
+on the 100 kΩ range). Drop to 1 kΩ then 100 Ω as C grows. The buffer 
+exists specifically so the 100 Ω range can pull 33 mA.</p>
+    </div></div>
+    </div>
+  </section>
+
+  <section id="theory">
+    <div class="wrap">
+      <div class="sec-head">
+        <div class="kicker">05 · Why the parts exist</div>
+        <h2>Equations the hardware is built around</h2>
+      </div>
+      <div class="grid-3" id="theory-cards"><div class="panel card"><span class="br"></span><span class="bl"></span><h3>Boost math</h3><div class="formula">VOUT = 0.6 (1 + R1/R2)</div><p>R1 = 150 kΩ, R2 = 4.7 kΩ → 19.75 V. This is the raw rail, later dropped across the Darlington.</p></div><div class="panel card"><span class="br"></span><span class="bl"></span><h3>Bias gain</h3><div class="formula">V_BIAS = 6.6 × 0.909 × V_DAC</div><p>Divider 10k/100k then non-inverting 56k/10k. Maps 0–3.3 V → 0–19.8 V.</p></div><div class="panel card"><span class="br"></span><span class="bl"></span><h3>Current limit</h3><div class="formula">I_LIM = Vbe / 10 Ω ≈ 65 mA</div><p>2N2222 Vbe across the emitter sense resistor. Hardware, not firmware.</p></div><div class="panel card"><span class="br"></span><span class="bl"></span><h3>Series C_block</h3><div class="formula">C_eq = C_b C_d / (C_b + C_d)</div><p>For 470 nF DUT, C_b = 1000 µF → error ~0.05 %. For 1000 µF DUT, C_eq = 500 µF — correct in firmware.</p></div><div class="panel card"><span class="br"></span><span class="bl"></span><h3>Oscillator</h3><div class="formula">C = 0.721 / (R f) − C_stray</div><p>Assumes 50 % thresholds. Include buffer Zo + mux Ron in R. C_stray ~ few pF + ADC/COMP pin.</p></div><div class="panel card"><span class="br"></span><span class="bl"></span><h3>Displacement</h3><div class="formula">Q = C_block ΔV ≈ 20 mC</div><p>Pre-charge of N_DUT by 20 V forces this charge through C_block. SSR3 + 1 Ω must swallow it.</p></div></div>
+    </div>
+  </section>
+
+  <section id="pins">
+    <div class="wrap">
+      <div class="sec-head">
+        <div class="kicker">06 · MCU map</div>
+        <h2>STM32G431CBU6 pin roles</h2>
+        <p class="lede">The G4 is the whole analog front-end: DAC for bias, ADC for RC tracking, COMP1 for oscillation, timers for period. Click a pin.</p>
+      </div>
+      <div class="pin-wrap">
+        <div class="panel" style="padding:16px">
+          <span class="br"></span><span class="bl"></span>
+          <div class="mcu" id="mcu"><div class="die"><b>STM32G431CBU6</b><div class="pin-lbl" style="margin-top:6px">UFQFPN-48 · analog core</div></div><div class="pin" data-pin="PA5" style="left:-8px; top:18%">PA5</div><div class="pin" data-pin="PA0" style="left:-8px; top:38%">PA0</div><div class="pin" data-pin="PA1" style="left:-8px; top:58%">PA1</div><div class="pin" data-pin="PA2" style="left:-8px; top:78%">PA2</div><div class="pin" data-pin="PB0" style="right:-8px; top:18%">PB0</div><div class="pin" data-pin="PB10" style="right:-8px; top:38%">PB10</div><div class="pin" data-pin="PB8" style="right:-8px; top:58%">PB8</div><div class="pin" data-pin="PA3" style="right:-8px; top:78%">PA3</div></div>
+        </div>
+        <aside class="panel card" id="pin-info">
+          <span class="br"></span><span class="bl"></span>
+          <div class="kicker">Pin inspector</div>
+          <h3>Select a pin</h3>
+          <p>Used pins are placed around the package. Unused pins are omitted for clarity.</p>
+        </aside>
+      </div>
+    </div>
+  </section>
+
+  <section id="bom">
+    <div class="wrap">
+      <div class="sec-head">
+        <div class="kicker">07 · Finalized bill of materials</div>
+        <h2>Every part, linked to the schematic</h2>
+        <p class="lede">Click a row to highlight it on the circuit. Values match the finalized BOM, including the STM32G431CBU6.</p>
+      </div>
+      <div class="panel" style="overflow:auto">
+        <span class="br"></span><span class="bl"></span>
+        <table class="data" id="bom-table"><thead><tr><th>Qty</th><th>Type</th><th>Value / PN</th><th>Circuit location</th></tr></thead><tbody><tr data-id="stm32" class=""><td>1</td><td>Microcontroller</td><td><code>STM32G431CBU6</code></td><td>Main MCU: DAC, ADC, COMP1, MUX + SSR control</td></tr><tr data-id="mt3608"><td>1</td><td>Boost module</td><td><code>MT3608</code></td><td>3.7 V → ~20 V raw bias rail (R1=150k, R2=4.7k)</td></tr><tr data-id="lm358"><td>1</td><td>Op-amp</td><td><code>LM358</code></td><td>Error amp for linear 0–20 V regulator, 6.6×</td></tr><tr data-id="buf" class=""><td>1</td><td>Logic buffer</td><td><code>SN74LVC1G34</code></td><td>Push-pull driver for MUX common, shields PB0</td></tr><tr data-id="mux" class=""><td>1</td><td>Analog mux</td><td><code>TMUX1104</code></td><td>4:1 low-leakage range select</td></tr><tr data-id="bat54s" class=""><td>1</td><td>Schottky array</td><td><code>BAT54S</code></td><td>Clamps V_cap to GND / 3.3 V</td></tr><tr data-id="tip122"><td>1</td><td>NPN Darlington</td><td><code>TIP122</code></td><td>Pass transistor of the bias supply</td></tr><tr data-id="q2222"><td>1</td><td>NPN transistor</td><td><code>2N2222</code></td><td>65 mA current-limit cutoff</td></tr><tr data-id="ssr1" class=""><td>3</td><td>PhotoMOS SSR</td><td><code>AQY212 / TLP241A</code></td><td>S1 pre-charge, S2 discharge, S3 clamp</td></tr><tr data-id="cblock"><td>1</td><td>Electrolytic</td><td><code>1000 µF / ≥25 V</code></td><td>C_block, isolates MCU from bias</td></tr><tr data-id="c100u"><td>1</td><td>Electrolytic</td><td><code>100 µF / ≥25 V</code></td><td>Filter on +22 V_RAW</td></tr><tr data-id="cnf"><td>1</td><td>Ceramic</td><td><code>100 nF / ≥25 V</code></td><td>HF bypass across C_block</td></tr><tr data-id="cdut"><td>1</td><td>MLCC (example DUT)</td><td><code>470 nF</code></td><td>Calibration test capacitor</td></tr><tr data-id="rbias" class=""><td>1</td><td>Resistor 1%</td><td><code>1 MΩ</code></td><td>High-Z DC bias injection</td></tr><tr data-id="mt3608"><td>1</td><td>Resistor 1%</td><td><code>150 kΩ</code></td><td>MT3608 R1</td></tr><tr data-id="r100k" class=""><td>2</td><td>Resistor 1%</td><td><code>100 kΩ</code></td><td>DAC pull-down; MUX CH1 high range</td></tr><tr data-id="r56k"><td>1</td><td>Resistor 1%</td><td><code>56 kΩ</code></td><td>LM358 feedback (6.6×)</td></tr><tr data-id="r10dac"><td>2</td><td>Resistor 1%</td><td><code>10 kΩ</code></td><td>DAC series; LM358 divider shunt</td></tr><tr data-id="mt3608"><td>1</td><td>Resistor 1%</td><td><code>4.7 kΩ</code></td><td>MT3608 R2</td></tr><tr data-id="r1k" class=""><td>2</td><td>Resistor 1%</td><td><code>1 kΩ</code></td><td>TIP122 base; MUX CH2 mid range</td></tr><tr data-id="r330" class=""><td>3</td><td>Resistor 1%</td><td><code>330 Ω</code></td><td>PhotoMOS LED current limit</td></tr><tr data-id="r100" class=""><td>2</td><td>Resistor 1%</td><td><code>100 Ω</code></td><td>Discharge path; MUX CH3 low range</td></tr><tr data-id="r10sense"><td>2</td><td>Resistor 1%</td><td><code>10 Ω</code></td><td>Bias sense; fast pre-charge</td></tr><tr data-id="r1clamp" class=""><td>1</td><td>Resistor 1%</td><td><code>1 Ω</code></td><td>Active V_cap clamp (SSR3)</td></tr></tbody></table>
+      </div>
+    </div>
+  </section>
+
+  <section id="sequence">
+    <div class="wrap">
+      <div class="sec-head">
+        <div class="kicker">08 · Firmware handshake</div>
+        <h2>Make the hardware function automatically</h2>
+        <p class="lede">The circuit is designed so GPIO timing, not 
+extra analog ICs, sequences the dangerous edges. This is the state 
+machine the timers and COMP1 should implement.</p>
+      </div>
+      <div class="grid-2">
+        <div class="panel card">
+          <span class="br"></span><span class="bl"></span>
+          <h3>Recommended state machine</h3>
+          <ol class="steps" id="fsm"><li>IDLE — all SSRs off, MUX CH4 (NC), PB0 low. DUT may be inserted.</li><li>DISCHARGE — PB8 on for ≥ 5τ of the previous C. Confirm V_DUT ~ 0 if you have a spare ADC divider.</li><li>PRE-
+CHARGE — PB10 on (SSR3 clamps V_cap, SSR1 charges N_DUT through 10 Ω). 
+Wait until I_sense dies out. DAC already sits at the requested V_BIAS.</li><li>ISOLATE — PB10 off. N_DUT remains at bias through 1 MΩ. V_cap is free. BAT54S still watching.</li><li>RANGE — set A0/A1. Start in 100 kΩ. If oscillator &lt; 50 Hz or RC τ too long, drop a range.</li><li>MEASURE OSC — enable COMP1 + TIM capture, toggle PB0 (or let COMP steer a timer output). Average N periods, compute C.</li><li>MEASURE RC — hold PB0 high, ADC DMA at a known Fs, fit τ, compute C. Discharge V_cap between repeats.</li><li>DISCHARGE — PB8 on. Then IDLE. Never unclip a biased DUT.</li></ol>
+        </div>
+        <div class="panel card">
+          <span class="br"></span><span class="bl"></span>
+          <h3>Peripheral plan</h3>
+          <div id="fw-plan">
+    <p><strong>DAC1 CH2 (PA5)</strong> — 12-bit, buffered, slow software updates. 0 code = 0 V bias.</p>
+    <p><strong>COMP1 (PA1)</strong> — INP = PA1, INM = DAC1 CH1 or VREFBUF/2, hysteresis on. Output to TIM2 input capture / EXTI that flips PB0.</p>
+    <p><strong>TIM2</strong> — period measurement in oscillator mode; timebase for ADC triggers in RC-step mode.</p>
+    <p><strong>ADC1 (PA0)</strong> — 12-bit, DMA circular, 1–4 µs sample. Ignore the first sample after a mux change (charge injection).</p>
+    <p><strong>GPIOs</strong> — PB10 and PB8 as push-pull with the 330 Ω LED resistors. Never PWM them; PhotoMOS need DC LED current.</p>
+    <div class="callout">Ready for the next session: configure COMP1, TIM2 input capture, and the PB10/PB8 safety sequencer exactly in that order.</div>
+  </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <div class="wrap">
+      Interactive circuit reference for the STM32 dual-mode capacitance 
+meter. Schematic, BOM and pin map follow the finalized architecture 
+(STM32G431CBU6, MT3608, LM358, TIP122, TMUX1104, SN74LVC1G34, 3× 
+AQY212).
+    </div>
+  </footer>
+
+  <script src="STM32%20Dual-Mode%20Capacitance%20Analyzer%20%E2%80%94%20Interactive%20Circuit_files/app.js"></script>
+
+
+</body></html>

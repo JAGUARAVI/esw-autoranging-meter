@@ -57,6 +57,31 @@
   </div>
 </section>
 
+<section class="safety" id="safetyPanel">
+  <div class="safety-col">
+    <div class="k">Front-end state</div>
+    <div id="feState" class="fe-badge idle">IDLE</div>
+    <div id="feDetail" class="meta dim">waiting for device…</div>
+  </div>
+  <div class="safety-col">
+    <div class="k">Power switches</div>
+    <div class="bits">
+      <span class="bit" id="bitSSR13" title="SSR1 pre-charge + SSR3 V_cap clamp (shared pin)">SSR1+SSR3</span>
+      <span class="bit" id="bitSSR2" title="SSR2 discharge">SSR2</span>
+      <span class="bit" id="bitDrive" title="SN74LVC1G34 drive">DRIVE</span>
+    </div>
+    <div class="meta dim">SSR1 and SSR3 share one GPIO — charging always clamps V_cap.</div>
+  </div>
+  <div class="safety-col actions">
+    <div class="k">Front-end power</div>
+    <button class="btn danger" id="btnPrecharge">Pre-charge C_block</button>
+    <button class="btn" id="btnDischarge">Discharge</button>
+    <button class="btn ghost" id="btnIdle">Idle (all off)</button>
+  </div>
+</section>
+<div id="feWarn" class="warn hidden"></div>
+<div id="toasts" class="toasts"></div>
+
 <section class="grid">
   <div class="card wide">
     <h2>Capacitance vs time <span class="dim">(log, pF)</span></h2>

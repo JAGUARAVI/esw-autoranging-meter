@@ -463,13 +463,28 @@ static int adc_read_avg_mv(int samples)
 // an exclusive command (zero/cal/probe) arrives mid-cycle.
 static bool g_stream = false;        // emit @@EVT machine-readable events
 static bool g_stream_curve = false;  // include the full ADC charge curve
-static bool g_run = true;            // normal mode: continuous autoranging
+static bool g_run = false;           // normal mode: idle until 'start' (safe boot)
 static int  g_range_lock = -1;       // normal mode: -1 = auto, else range index
 static bool g_single_shot = false;   // measure one cycle then stop
 static volatile bool g_abort_cycle = false;
 static volatile bool g_measuring = false;
 static uint8_t g_console_range = 2;  // range used by cal/probe/status
 static char g_pending_cmd[64];       // exclusive command queued during a cycle
+
+// Front-end safety state (reference state machine).  Reported to the dashboard
+// so the operator always knows whether the DUT is biased, isolated or moving.
+typedef enum {
+    FE_IDLE = 0,     // all SSRs off, drive low — safe to touch the DUT
+    FE_PRECHARGE,    // SSR1+SSR3 on: charging C_block/N_DUT at bias
+    FE_PRECHARGED,   // isolated, N_DUT still biased — do NOT remove the DUT
+    FE_MEASURING,    // autoranging
+    FE_DISCHARGE,    // SSR2 on: DUT/C_block bleeding to GND
+} fe_state_t;
+static fe_state_t g_fe_state = FE_IDLE;
+// Energy-state flags for the dashboard's charged/discharged indicator.  Both
+// false means "unknown" (e.g. just booted, never charged or discharged here).
+static bool g_fe_charged = false;      // N_DUT/C_block currently at bias
+static bool g_fe_discharged = false;   // bled to GND since the last charge
 
 // Wait until V_cap falls below V_START_MV (100 kΩ and 1 MΩ ranges bleed charge
 // slowly, so the budget scales with the range resistor).
@@ -508,6 +523,54 @@ static void prepare_measurement(void)
 
     gpio_set_level(SSR_S2_PIN, 0);
     esp_rom_delay_us(ISOLATION_DELAY_US);
+}
+
+// ---------------------------------------------------------------------------
+// Front-end safety lifecycle (reference state machine:
+//   IDLE -> DISCHARGE -> PRE-CHARGE -> ISOLATE -> ... measure ... -> DISCHARGE
+//   -> IDLE)
+//
+// SSR1 (PRE-CHARGE, V_BIAS -> 10 Ω -> N_DUT) and SSR3 (V_cap clamp, V_cap ->
+// 1 Ω -> GND) are driven by the SAME pin (SSR_S1_S3_PIN).  Enabling one always
+// enables the other: that is the hardware interlock that prevents V_cap from
+// rising while N_DUT is charged.  SSR2 (DISCHARGE, N_DUT -> 100 Ω -> GND) is
+// the only DUT ground path.  Never energise SSR1 unless SSR3 is on — here that
+// is automatic.
+// ---------------------------------------------------------------------------
+
+// IDLE: every SSR off, drive low.  Safe to insert/remove a DUT.
+static void front_end_idle(void)
+{
+    gpio_set_level(DRIVE_PIN, 0);
+    gpio_set_level(SSR_S2_PIN, 0);
+    gpio_set_level(SSR_S1_S3_PIN, 0);
+    gpio_set_level(VBIAS_PIN, 0);
+}
+
+// PRE-CHARGE -> ISOLATE: SSR1+SSR3 charge N_DUT toward V_BIAS through 10 Ω
+// while SSR3 clamps V_cap to GND through 1 Ω.  SSR2 stays OFF so the 100 Ω
+// discharge path does not fight the pre-charge.  Releasing SSR1/SSR3 leaves
+// N_DUT held at bias through the 1 MΩ R_bias and V_cap free to move.
+static void front_end_precharge(void)
+{
+    gpio_set_level(DRIVE_PIN, 0);
+    gpio_set_level(SSR_S2_PIN, 0);        // no discharge during pre-charge
+    gpio_set_level(SSR_S1_S3_PIN, 1);     // SSR1 (charge) + SSR3 (V_cap clamp)
+    safe_delay_ms(PRECHARGE_HOLD_MS);
+    gpio_set_level(SSR_S1_S3_PIN, 0);     // ISOLATE
+    esp_rom_delay_us(ISOLATION_DELAY_US);
+}
+
+// DISCHARGE: SSR2 pulls N_DUT to GND through 100 Ω; the series C_block is
+// drained with it (the V_cap side is caught by the BAT54S clamp).  Then IDLE.
+static void front_end_discharge(void)
+{
+    gpio_set_level(DRIVE_PIN, 0);
+    gpio_set_level(SSR_S1_S3_PIN, 0);
+    gpio_set_level(SSR_S2_PIN, 1);
+    safe_delay_ms(DISCHARGE_HOLD_MS);
+    gpio_set_level(SSR_S2_PIN, 0);
+    gpio_set_level(VBIAS_PIN, 0);
 }
 
 static void system_hw_init(void)
@@ -727,6 +790,39 @@ static void evt_ack(const char *cmd, int ok, const char *msg)
     if (!g_stream) return;
     printf("@@EVT {\"t\":\"ack\",\"cmd\":\"%s\",\"ok\":%s,\"msg\":\"%s\"}\n",
            cmd, ok ? "true" : "false", msg);
+}
+
+// Front-end state + live SSR pin levels (safety telemetry for the dashboard).
+static const char *fe_name(fe_state_t s)
+{
+    switch (s) {
+        case FE_PRECHARGE:  return "precharge";
+        case FE_PRECHARGED: return "precharged";
+        case FE_MEASURING:  return "measuring";
+        case FE_DISCHARGE:  return "discharge";
+        default:            return "idle";
+    }
+}
+
+static void evt_fe(void)
+{
+    if (!g_stream) return;
+    printf("@@EVT {\"t\":\"fe\",\"state\":\"%s\",\"ssr13\":%d,\"ssr2\":%d,\"drive\":%d,"
+           "\"biased\":%s,\"charged\":%s,\"discharged\":%s}\n",
+           fe_name(g_fe_state),
+           gpio_get_level(SSR_S1_S3_PIN), gpio_get_level(SSR_S2_PIN),
+           gpio_get_level(DRIVE_PIN),
+           g_fe_state == FE_PRECHARGED ? "true" : "false",
+           g_fe_charged ? "true" : "false",
+           g_fe_discharged ? "true" : "false");
+}
+
+// Change state and announce it (no-op if unchanged).
+static void fe_set(fe_state_t s)
+{
+    if (g_fe_state == s) return;
+    g_fe_state = s;
+    evt_fe();
 }
 
 // Log a single raw reading (one range / one method) with its verdict.
@@ -1985,8 +2081,11 @@ static void console_help(void)
            "  help                 this list\n"
            "  status | p           live oscillator / pin / frequency state\n"
            "  0-3                  select range for cal/probe/status\n"
-           "  start | stop         normal mode: run / halt autoranging\n"
-           "  single               normal mode: measure one cycle then stop\n"
+           "  start | stop         autoranging on / off (safe boot = stopped)\n"
+           "  single               measure one cycle then stop\n"
+           "  precharge            SSR1+SSR3: charge C_block/N_DUT at V_BIAS (isolates after)\n"
+           "  discharge            SSR2: bleed DUT/C_block to GND, then all SSRs off\n"
+           "  idle                 all SSRs off, drive low (safe to touch DUT)\n"
            "  auto                 normal mode: autorange (undo 'range')\n"
            "  range <0-3>          normal mode: lock a single range\n"
            "  zero                 tare T0 with socket EMPTY (removes parasitic C)\n"
@@ -2012,6 +2111,40 @@ static bool console_handle_hw(const char *line)
     if (!strcmp(line, "r")) {
         dbg_stop(); prepare_measurement(); dbg_start();
         printf(">> discharged+restarted\n");
+        return true;
+    }
+
+    // ---- Front-end safety commands (exclusive; halt measurement first) ----
+    if (!strcmp(line, "precharge")) {
+        g_run = false;                       // never drive SSRs under a cycle
+        g_fe_charged = true; g_fe_discharged = false;
+        fe_set(FE_PRECHARGE);
+        front_end_idle();                    // start from a known-off state
+        front_end_precharge();               // SSR1+SSR3 hold, then ISOLATE
+        fe_set(FE_PRECHARGED);
+        printf(">> PRE-CHARGE: N_DUT/C_block charged; SSR1+SSR3 released (isolated).\n"
+               ">> WARNING: DUT may sit at up to 20 V bias. Run 'discharge' before removing it.\n");
+        evt_ack("precharge", 1, "N_DUT biased up to 20 V; discharge before removing DUT");
+        return true;
+    }
+    if (!strcmp(line, "discharge")) {
+        g_run = false;
+        fe_set(FE_DISCHARGE);
+        front_end_discharge();               // SSR2 to GND for >= 5 tau
+        front_end_idle();
+        g_fe_charged = false; g_fe_discharged = true;
+        fe_set(FE_IDLE);
+        printf(">> DISCHARGE: DUT and C_block bled to GND; all SSRs off (IDLE).\n"
+               ">> Safe to remove the DUT.\n");
+        evt_ack("discharge", 1, "DUT discharged; safe to remove");
+        return true;
+    }
+    if (!strcmp(line, "idle")) {
+        g_run = false;
+        front_end_idle();
+        fe_set(FE_IDLE);
+        printf(">> IDLE: all SSRs off, drive low.\n");
+        evt_ack("idle", 1, "all SSRs off");
         return true;
     }
 
@@ -2072,7 +2205,7 @@ static bool console_handle_hw(const char *line)
     if (!strncmp(line, "stream", 6)) {
         g_stream = (strstr(line, "on") != NULL);
         printf(">> telemetry stream %s\n", g_stream ? "ON" : "OFF");
-        if (g_stream) evt_boot();   // resend the boot snapshot to the new client
+        if (g_stream) { evt_boot(); evt_fe(); }  // snapshot for the new client
         return true;
     }
     if (!strncmp(line, "curve", 5)) {
@@ -2095,6 +2228,10 @@ static bool console_handle_hw(const char *line)
 // must therefore abort an in-flight measurement before running.
 static bool is_exclusive_cmd(const char *line)
 {
+    // Front-end power commands must never run concurrently with a measurement
+    // cycle: they abort the cycle first, then own the SSRs exclusively.
+    if (!strcmp(line, "precharge") || !strcmp(line, "discharge") ||
+        !strcmp(line, "idle")) return true;
     if (!strcmp(line, "zero") || !strcmp(line, "zeroall")) return true;
     if (!strncmp(line, "calclear", 8)) return true;
     if (!strncmp(line, "probe", 5)) return true;
@@ -2107,9 +2244,17 @@ static void console_dispatch(const char *line)
 {
     if (g_in_hw_cmd) return;   // busy running an exclusive command
 
-    if (!strcmp(line, "start")) { g_run = true; g_single_shot = false; evt_ack("start", 1, "running"); return; }
-    if (!strcmp(line, "stop"))  { g_run = false; evt_ack("stop", 1, "stopped"); return; }
-    if (!strcmp(line, "single")){ g_single_shot = true; g_run = true; evt_ack("single", 1, "one cycle"); return; }
+    // start/stop/single only gate the autoranging loop.  Front-end power is a
+// separate concern ('precharge'/'discharge'/'idle').  Stopping aborts any
+// in-flight cycle so the transition is prompt.
+    if (!strcmp(line, "start")) { g_run = true; g_single_shot = false;
+                                  evt_ack("start", 1, "autoranging"); return; }
+    if (!strcmp(line, "stop"))  { g_run = false;
+                                  if (g_measuring) g_abort_cycle = true;
+                                  fe_set(FE_IDLE);
+                                  evt_ack("stop", 1, "stopped; front-end isolated"); return; }
+    if (!strcmp(line, "single")){ g_single_shot = true; g_run = true;
+                                  evt_ack("single", 1, "one cycle"); return; }
     if (!strcmp(line, "auto"))  { g_range_lock = -1; evt_ack("auto", 1, "autorange"); return; }
     if (!strncmp(line, "range", 5)) {
         int rr = g_console_range;
@@ -2282,8 +2427,9 @@ void app_main(void)
         }
     }
     printf("\n=== CAP METER (normal mode) ===\n"
-           "Autoranging by default. Type 'h' for commands: start/stop/single, "
-           "range/auto, zero/zeroall, cal/cal1/cal2, probe, stream/curve.\n"
+           "Boots IDLE. Type 'h' for commands: start/stop/single, "
+           "precharge/discharge/idle, range/auto, zero/zeroall, cal/cal1/cal2, "
+           "probe, stream/curve.\n"
            "Enable machine telemetry with 'stream on' (append 'curve on' for ADC curves).\n\n");
 
     // A full measurement cycle can take tens of seconds (large DUTs on the
@@ -2296,6 +2442,11 @@ void app_main(void)
     };
     esp_task_wdt_reconfigure(&wdt_cfg);
     esp_task_wdt_add(NULL); // subscribe the current (main) task
+
+    // Boots IDLE: g_run is false, so no measurement or SSR activity starts
+    // until the operator (or dashboard) issues 'start'.  Front-end power is
+    // controlled separately by precharge/discharge/idle, which always halt
+    // measurement first (see console_dispatch / is_exclusive_cmd).
 
     while (true) {
         service_console();
@@ -2318,6 +2469,11 @@ void app_main(void)
             continue;
         }
 
+        if (g_fe_state != FE_MEASURING) {
+            g_fe_charged = true; g_fe_discharged = false;   // cycles bias C_block
+            fe_set(FE_MEASURING);
+        }
+
         g_phase = "auto";
         g_measuring = true;
         fusion_t result = (g_range_lock >= 0)
@@ -2333,7 +2489,8 @@ void app_main(void)
         log_result(&result);
         evt_cycle(&result);
 
-        if (g_single_shot) { g_single_shot = false; g_run = false; }
+        if (g_single_shot) { g_single_shot = false; g_run = false;
+                             fe_set(FE_IDLE); }
 
         safe_delay_ms(1000);
     }

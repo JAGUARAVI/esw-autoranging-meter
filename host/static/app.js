@@ -11,7 +11,18 @@ const state = {
   cal: [],
   curSamples: [],
   lastCalres: null,
+  fe: null,             // latest front-end state
 };
+
+// ---------------------------------------------------------------- toasts
+function toast(msg, cls = "", ttl = 4500) {
+  const box = document.getElementById("toasts");
+  const el = document.createElement("div");
+  el.className = "toast " + cls;
+  el.textContent = msg;
+  box.appendChild(el);
+  setTimeout(() => el.remove(), ttl);
+}
 
 // ---------------------------------------------------------------- formatting
 function formatCap(f) {
@@ -241,6 +252,47 @@ function onTare(ev) {
   }
   charts.tare.set("r" + ev.range, ev.period_us);
 }
+// ------------------------------------------------- front-end / safety state
+function updateFe(ev) {
+  state.fe = ev;
+  const badge = document.getElementById("feState");
+  const names = {
+    idle: "IDLE", precharge: "PRE-CHARGING", precharged: "CHARGED / BIASED",
+    measuring: "MEASURING", discharge: "DISCHARGING",
+  };
+  badge.textContent = names[ev.state] || String(ev.state).toUpperCase();
+  badge.className = "fe-badge " + ev.state;
+
+  const detail = document.getElementById("feDetail");
+  let d;
+  if (ev.state === "precharged") d = "N_DUT held at V_BIAS through R_bias — do NOT remove the DUT";
+  else if (ev.state === "precharge") d = "SSR1+SSR3 on: charging DUT/C_block, clamping V_cap";
+  else if (ev.state === "measuring") d = "autoranging through C_block";
+  else if (ev.state === "discharge") d = "SSR2 on: bleeding DUT/C_block to GND";
+  else d = ev.charged
+    ? "isolated, but N_DUT may still be biased via R_bias"
+    : (ev.discharged ? "discharged — safe to remove the DUT" : "all SSRs off · safe to touch the DUT");
+  detail.textContent = d;
+
+  document.getElementById("bitSSR13").classList.toggle("on", !!ev.ssr13);
+  document.getElementById("bitSSR2").classList.toggle("on", !!ev.ssr2);
+  document.getElementById("bitDrive").classList.toggle("on", !!ev.drive);
+
+  const warn = document.getElementById("feWarn");
+  if (ev.state === "precharged" || (ev.state === "idle" && ev.charged)) {
+    warn.classList.remove("hidden");
+    warn.textContent = ev.state === "precharged"
+      ? "⚠ DUT is CHARGED (biased). Press Discharge before touching or removing the DUT."
+      : "⚠ Front-end idle, but N_DUT may still hold bias through R_bias. Press Discharge to bleed it.";
+  } else {
+    warn.classList.add("hidden");
+  }
+}
+function onAck(ev) {
+  if (ev.ok) toast("✓ " + ev.cmd + " — " + ev.msg, "ok");
+  else toast("✗ " + ev.cmd + " — " + ev.msg, "warn", 6000);
+}
+
 function onEvent(ev) {
   switch (ev.t) {
     case "boot": onBoot(ev); break;
@@ -250,6 +302,8 @@ function onEvent(ev) {
     case "tare": onTare(ev); break;
     case "calpt": onCalpt(ev); break;
     case "calres": onCalres(ev); break;
+    case "fe": updateFe(ev); break;
+    case "ack": onAck(ev); break;
   }
 }
 
@@ -294,6 +348,31 @@ function appendLog(line) {
 document.getElementById("btnStart").onclick = () => cmd("start");
 document.getElementById("btnStop").onclick = () => cmd("stop");
 document.getElementById("btnSingle").onclick = () => cmd("single");
+
+document.getElementById("btnPrecharge").onclick = () => {
+  const msg =
+    "PRE-CHARGE will apply the external DC bias (up to 20 V) across the DUT " +
+    "through SSR1, and clamp V_cap to GND through SSR3.\n\n" +
+    "Confirm before continuing:\n" +
+    "• the DUT is correctly seated and rated for the applied bias\n" +
+    "• the DUT stays biased after charging until you press Discharge\n" +
+    "• you will not touch or remove the DUT while it is charged\n\n" +
+    "Pre-charge now?";
+  if (confirm(msg)) {
+    cmd("precharge");
+    toast("Pre-charge requested — watch the front-end state.", "warn", 4000);
+  }
+};
+document.getElementById("btnDischarge").onclick = () => {
+  cmd("discharge");
+  toast("Discharge requested — wait for the confirmation.", "warn", 4000);
+};
+document.getElementById("btnIdle").onclick = () => {
+  if (confirm("Go IDLE (turn all SSRs off) WITHOUT discharging?\n\n" +
+              "If the DUT is charged it may remain biased through R_bias. " +
+              "Prefer Discharge for safety."))
+    cmd("idle");
+};
 document.getElementById("mode").onchange = (e) => {
   const v = e.target.value;
   cmd(v === "-1" ? "auto" : "range " + v);

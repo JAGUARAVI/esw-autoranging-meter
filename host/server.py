@@ -37,6 +37,8 @@ HIST = {
     "tare": deque(maxlen=4000),
     "calpt": deque(maxlen=2000),
     "calres": deque(maxlen=500),
+    "fe": deque(maxlen=1000),
+    "ack": deque(maxlen=2000),
 }
 
 
@@ -64,7 +66,8 @@ class Hub:
         self.log_lines: deque[str] = deque(maxlen=1000)
         # State snapshot for late-joining clients / the REST endpoint.
         self.latest: dict = {"cycle": None, "boot": None, "tare": None,
-                             "calres": None, "calpt": None}
+                             "calres": None, "calpt": None, "fe": None,
+                             "ack": None}
         self.curve_requested = False
 
     # ---- broadcast helpers -------------------------------------------------
@@ -176,6 +179,12 @@ class Hub:
             elif kind == "calres":
                 self.latest["calres"] = ev
                 HIST["calres"].append(ev)
+            elif kind == "fe":
+                self.latest["fe"] = ev
+                HIST["fe"].append(ev)
+            elif kind == "ack":
+                self.latest["ack"] = ev
+                HIST["ack"].append(ev)
             elif kind == "sample":
                 HIST["sample"].append(ev)
             await self.broadcast({"type": "event", "event": ev})
