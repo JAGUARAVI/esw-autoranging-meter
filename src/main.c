@@ -109,8 +109,8 @@ static inline int64_t atomic_read_i64(volatile int64_t *p)
 #define PROBE_MIN_VALID_US 200 // probe on a "slow" range trusts τ ≥ this
 #define MAX_SAMPLES 12         // 4 ADC + probe + best OSC + alt OSC + headroom
 
-#define PRECHARGE_HOLD_MS 600
-#define DISCHARGE_HOLD_MS 600
+#define PRECHARGE_HOLD_MS 1000
+#define DISCHARGE_HOLD_MS 1000
 #define ISOLATION_DELAY_US 2000
 #define ADC_TIMEOUT_FAST_US 5000000LL    // 5 s for high-resistance ranges
 #define ADC_TIMEOUT_SLOW_US 15000000LL   // 15 s for the 100 Ω / 1 kΩ ranges
@@ -128,7 +128,7 @@ static inline int64_t atomic_read_i64(volatile int64_t *p)
 #define OSC_F_SWEET_HZ 2000.0 // centre of the low-latency oscillator band
 
 // Minimum acceptable oscillator frequency — below this, ISR latency dominates
-#define OSC_MIN_F_HZ 20.0
+#define OSC_MIN_F_HZ 10.0
 
 // Fusion tuning
 // Relative (fractional) outlier gate around the median.  This is NOT a
@@ -143,7 +143,7 @@ static const char *TAG = "CAP_METER";
 // Set to 1 and flash to get an interactive, oscilloscope-friendly oscillator
 // bring-up console (bypasses the autoranger entirely).  Serial commands:
 //   0/1/2/3 = range (100Ω/1kΩ/100kΩ/1MΩ)   g = start   s = stop
-//   r = discharge+restart   p/? = dump live pin/edge/freq state   h = help
+//   r = isolate+restart   p/? = dump live pin/edge/freq state   h = help
 // Probe GPIO14 (LM393 out) and GPIO16 (drive) on the scope.  Set back to 0 for
 // normal fused measurement.  (Can also be forced with -DOSC_DEBUG_MODE=1.)
 #ifndef OSC_DEBUG_MODE
@@ -317,6 +317,98 @@ static esp_err_t osc_cal_save(void)
     return err;
 }
 
+// ---------------------------------------------------------------------------
+// Per-range ADC (RC-step) calibration
+// ---------------------------------------------------------------------------
+// The RC-step measures τ = R_eff·(C_dut + C0), where R_eff = R_nom + R_series
+// (buffer output impedance + mux Ron + wiring).  On the 100 Ω / 1 kΩ ranges
+// R_series is a large fraction of R_nom (tens of ohms), so without calibration
+// C is over-read by (R_nom+R_series)/R_nom.  We solve and store a measured
+// R_eff and offset C0 per range from known reference capacitors, using the
+// exact same τ estimator the runtime uses.  (The oscillator absorbs R_series
+// in its calibrated K; the ADC previously had no equivalent.)
+typedef struct {
+    double r_eff_ohm;   // measured R_nom + R_series
+    double c0_f;        // node offset capacitance
+    bool   valid;
+} adc_cal_t;
+
+static adc_cal_t g_adc_cal[RANGE_COUNT] = {
+    {0.0, 0.0, false}, {0.0, 0.0, false}, {0.0, 0.0, false}, {0.0, 0.0, false},
+};
+
+static inline bool   adc_cal_valid(uint8_t i) { return g_adc_cal[i].valid; }
+static inline double adc_r_eff(uint8_t i)     { return g_adc_cal[i].r_eff_ohm; }
+static inline double adc_c0(uint8_t i)        { return g_adc_cal[i].c0_f; }
+
+// The oscillator and ADC share the V_cap node, so the oscillator tare T0 gives
+// a good estimate of the ADC node stray when no ADC offset has been solved.
+static double node_stray_estimate_f(uint8_t i)
+{
+    double k = osc_k(i);
+    double r = RANGES[i].resistance_ohms;
+    if (osc_has_t0(i) && k > 0.0 && r > 0.0 && osc_t0(i) > 0.0)
+        return (osc_t0(i) * 1e-6) / (k * r);
+    return STRAY_CAPACITANCE_F;
+}
+
+#define ADC_CAL_NVS_NS "adc_cal"
+
+static void adc_cal_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(ADC_CAL_NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
+    for (int i = 0; i < RANGE_COUNT; ++i) {
+        char key[8];
+        int64_t v = 0;
+        snprintf(key, sizeof(key), "r%d", i);
+        if (nvs_get_i64(h, key, &v) == ESP_OK) g_adc_cal[i].r_eff_ohm = (double)v / 1e3;   // mΩ
+        snprintf(key, sizeof(key), "c%d", i);
+        if (nvs_get_i64(h, key, &v) == ESP_OK) g_adc_cal[i].c0_f = (double)v / 1e15;       // fF
+        snprintf(key, sizeof(key), "v%d", i);
+        uint8_t valid = 0;
+        if (nvs_get_u8(h, key, &valid) == ESP_OK) g_adc_cal[i].valid = (valid != 0);
+    }
+    nvs_close(h);
+}
+
+static esp_err_t adc_cal_save(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(ADC_CAL_NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    for (int i = 0; i < RANGE_COUNT; ++i) {
+        char key[8];
+        snprintf(key, sizeof(key), "r%d", i);
+        nvs_set_i64(h, key, (int64_t)(g_adc_cal[i].r_eff_ohm * 1e3));
+        snprintf(key, sizeof(key), "c%d", i);
+        nvs_set_i64(h, key, (int64_t)(g_adc_cal[i].c0_f * 1e15));
+        snprintf(key, sizeof(key), "v%d", i);
+        nvs_set_u8(h, key, g_adc_cal[i].valid ? 1 : 0);
+    }
+    err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
+// Solve the two-point model τ = R_eff·(C + C0):
+//      R_eff = (τ1 − τ2)/(C1 − C2),   C0 = τ1/R_eff − C1
+static bool adc_cal_solve_two(double tau1_us, double c1_f,
+                              double tau2_us, double c2_f,
+                              double *r_eff, double *c0_f)
+{
+    if (tau1_us <= 0.0 || tau2_us <= 0.0) return false;
+    double dc = c1_f - c2_f;
+    if (fabs(dc) < 1e-18) return false;               // refs too similar
+    double r = ((tau1_us - tau2_us) * 1e-6) / dc;
+    if (r <= 1.0 || r > 1e7) return false;            // sane ohms
+    double off = (tau1_us * 1e-6) / r - c1_f;
+    if (off < -1e-9 || off > 1e-6) return false;      // sane 0..1 µF
+    *r_eff = r;
+    *c0_f = off;
+    return true;
+}
+
 // Series-equivalent of a DUT *alone* (no stray).  The oscillator's measured
 // open-node tare T0 absorbs the parasitic capacitance, so calibration works in
 // DUT deltas above the open baseline and must NOT add STRAY here.  Adding the
@@ -397,11 +489,38 @@ static volatile uint32_t osc_edge_count = 0;     // rising edges seen (for timin
 static volatile int64_t osc_first_rise_time = 0; // first rising edge
 static volatile int64_t osc_last_rise_time = 0;  // most recent rising edge
 static volatile bool osc_running = false;
+static volatile uint32_t osc_last_edge_us = 0;   // ISR rate-limit timestamp
+
+// Software-loop watchdog.  If the LM393 toggles faster than this the ISR is
+// saturating the core (e.g. a few pF on the 100 Ω / 1 kΩ ranges).  The ISR then
+// shuts the loop down, so the device can never freeze; the affected sample is
+// simply rejected as "too fast".  This is a frequency guard, not a range ban —
+// a large cap on 100 Ω / 1 kΩ runs slowly and is measured normally.
+#define OSC_MIN_EDGE_INTERVAL_US 3
+
+// Start the software-in-the-loop oscillator: reset the rate limiter and prime
+// the drive with the comparator's current level.
+static void osc_loop_start(void)
+{
+    osc_last_edge_us = 0;
+    osc_running = true;
+    gpio_set_level(DRIVE_PIN, (uint32_t)gpio_get_level(LM393_OUT_PIN));
+}
 
 static void IRAM_ATTR lm393_isr_handler(void *arg)
 {
     (void)arg;
     if (!osc_running) return;
+
+    // Rate limit: too many edges/sec -> stop before the CPU is overwhelmed.
+    uint32_t now32 = (uint32_t)esp_timer_get_time();
+    if (osc_last_edge_us != 0 &&
+        (uint32_t)(now32 - osc_last_edge_us) < OSC_MIN_EDGE_INTERVAL_US) {
+        osc_running = false;
+        gpio_set_level(DRIVE_PIN, 0);
+        return;
+    }
+    osc_last_edge_us = now32;
 
     // 1. Close the loop: mirror the comparator state onto the drive buffer.
     uint32_t state = (uint32_t)gpio_get_level(LM393_OUT_PIN);
@@ -486,6 +605,14 @@ static fe_state_t g_fe_state = FE_IDLE;
 static bool g_fe_charged = false;      // N_DUT/C_block currently at bias
 static bool g_fe_discharged = false;   // bled to GND since the last charge
 
+// Automation flags (dashboard-controlled, default OFF => the operator drives the
+// front-end explicitly).  auto-precharge makes the measurement path re-establish
+// the DC bias before every reading; auto-discharge bleeds the node when a
+// measurement session ends.  Neither ever opens SSR2 during a live measurement.
+static bool g_auto_precharge = false;
+static bool g_auto_discharge = false;
+static bool g_fe_finish_pending = false; // deferred finish after a 'stop' aborts
+
 // Wait until V_cap falls below V_START_MV (100 kΩ and 1 MΩ ranges bleed charge
 // slowly, so the budget scales with the range resistor).
 static bool wait_for_start_threshold(uint8_t range_idx)
@@ -504,24 +631,31 @@ static bool wait_for_start_threshold(uint8_t range_idx)
 // Defined further down but needed by the measurement loops (abort-on-command).
 static void service_console(void);
 static void safe_delay_ms(uint32_t ms);
+static void fe_set(fe_state_t s);
 
-// Full safe state cycle: pre-charge DUT at bias, discharge, isolate.
+// Prepare the front-end for a measurement WITHOUT disturbing the DC bias.
+// SSR2 (the discharge switch) is NEVER closed here: closing it would dump the
+// precharged C_block/C_dut and the DUT would no longer be measured at V_BIAS.
+// The MCU-side node V_cap is reset to ~0 V purely by driving DRIVE low (the
+// caller then waits for the start threshold); that does not discharge the DUT
+// because C_block blocks DC.
+//
+// With auto-precharge armed we (re)assert the bias in the reference order
+// (PRE-CHARGE with SSR2 OFF -> ISOLATE).  Otherwise we simply isolate and let
+// the operator's manual precharge hold.
 static void prepare_measurement(void)
 {
     gpio_set_level(DRIVE_PIN, 0);
-    gpio_set_level(SSR_S1_S3_PIN, 0);
+    gpio_set_level(SSR_S2_PIN, 0);        // hold the bias: never discharge here
     gpio_set_level(VBIAS_PIN, 0);
 
-    gpio_set_level(SSR_S2_PIN, 1);
-    gpio_set_level(SSR_S1_S3_PIN, 1);
-    gpio_set_level(DRIVE_PIN, 1);
-    safe_delay_ms(PRECHARGE_HOLD_MS);   // console-aware: an abort shortens it
-
-    gpio_set_level(DRIVE_PIN, 0);
-    gpio_set_level(SSR_S1_S3_PIN, 0);
-    safe_delay_ms(DISCHARGE_HOLD_MS);
-
-    gpio_set_level(SSR_S2_PIN, 0);
+    if (g_auto_precharge) {
+        gpio_set_level(SSR_S1_S3_PIN, 1); // SSR1 precharge + SSR3 V_cap clamp
+        safe_delay_ms(PRECHARGE_HOLD_MS);
+        gpio_set_level(SSR_S1_S3_PIN, 0); // ISOLATE; R_bias holds the bias
+    } else {
+        gpio_set_level(SSR_S1_S3_PIN, 0); // isolated: keep the existing bias
+    }
     esp_rom_delay_us(ISOLATION_DELAY_US);
 }
 
@@ -571,6 +705,23 @@ static void front_end_discharge(void)
     safe_delay_ms(DISCHARGE_HOLD_MS);
     gpio_set_level(SSR_S2_PIN, 0);
     gpio_set_level(VBIAS_PIN, 0);
+}
+
+// End-of-session front-end state.  With auto-discharge armed we bleed the node
+// for safety; otherwise we isolate and leave N_DUT/C_block at their bias so the
+// next measurement starts from the same operating point (manual discharge is
+// required before removing the DUT).
+static void front_end_finish(void)
+{
+    if (g_auto_discharge) {
+        fe_set(FE_DISCHARGE);
+        front_end_discharge();
+        g_fe_charged = false;
+        g_fe_discharged = true;
+    } else {
+        front_end_idle();
+    }
+    fe_set(FE_IDLE);
 }
 
 static void system_hw_init(void)
@@ -709,11 +860,14 @@ static void evt_boot(void)
     for (int i = 0; i < RANGE_COUNT; ++i) {
         if (i) printf(",");
         printf("{\"i\":%d,\"label\":\"%s\",\"r\":%.0f,\"mux\":%d,\"k\":%.6g,"
-               "\"t0_us\":%.6g,\"has_t0\":%s,\"valid\":%s}",
+               "\"t0_us\":%.6g,\"has_t0\":%s,\"valid\":%s,"
+               "\"adc_r_eff\":%.6g,\"adc_c0_f\":%.6g,\"adc_valid\":%s}",
                i, RANGES[i].label, RANGES[i].resistance_ohms, RANGES[i].mux_channel,
                g_osc_cal[i].k, g_osc_cal[i].t0_us,
                g_osc_cal[i].has_t0 ? "true" : "false",
-               g_osc_cal[i].valid ? "true" : "false");
+               g_osc_cal[i].valid ? "true" : "false",
+               g_adc_cal[i].r_eff_ohm, g_adc_cal[i].c0_f,
+               g_adc_cal[i].valid ? "true" : "false");
     }
     printf("]}\n");
 }
@@ -774,6 +928,24 @@ static void evt_calres(int range_idx, const char *op, double k, double t0, int o
            op, range_idx, k, t0, ok ? "true" : "false");
 }
 
+// ADC (RC-step) calibration telemetry: τ vs reference C, and the solved
+// effective resistance / offset.
+static void evt_adccalpt(int range_idx, const char *op, double ref_pf, double tau_us)
+{
+    if (!g_stream) return;
+    printf("@@EVT {\"t\":\"adccalpt\",\"op\":\"%s\",\"range\":%d,\"ref_pf\":%.6g,"
+           "\"tau_us\":%.6g}\n", op, range_idx, ref_pf, tau_us);
+}
+
+static void evt_adccalres(int range_idx, const char *op, double r_eff, double c0_f, int ok)
+{
+    if (!g_stream) return;
+    printf("@@EVT {\"t\":\"adccalres\",\"op\":\"%s\",\"range\":%d,\"r_eff\":%.6g,"
+           "\"c0_f\":%.6g,\"r_nom\":%.6g,\"ok\":%s}\n",
+           op, range_idx, r_eff, c0_f, RANGES[range_idx].resistance_ohms,
+           ok ? "true" : "false");
+}
+
 static void evt_tare(int range_idx, int idx, int total, double freq,
                      double t0_us, double stray_pf, int done)
 {
@@ -808,13 +980,16 @@ static void evt_fe(void)
 {
     if (!g_stream) return;
     printf("@@EVT {\"t\":\"fe\",\"state\":\"%s\",\"ssr13\":%d,\"ssr2\":%d,\"drive\":%d,"
-           "\"biased\":%s,\"charged\":%s,\"discharged\":%s}\n",
+           "\"biased\":%s,\"charged\":%s,\"discharged\":%s,"
+           "\"auto_pre\":%s,\"auto_dis\":%s}\n",
            fe_name(g_fe_state),
            gpio_get_level(SSR_S1_S3_PIN), gpio_get_level(SSR_S2_PIN),
            gpio_get_level(DRIVE_PIN),
            g_fe_state == FE_PRECHARGED ? "true" : "false",
            g_fe_charged ? "true" : "false",
-           g_fe_discharged ? "true" : "false");
+           g_fe_discharged ? "true" : "false",
+           g_auto_precharge ? "true" : "false",
+           g_auto_discharge ? "true" : "false");
 }
 
 // Change state and announce it (no-op if unchanged).
@@ -869,6 +1044,14 @@ static void log_sample(const char *phase, const sample_t *s)
 
 // Per-range measured asymptote cache (mV).  0 = not yet measured.
 int g_v_inf_cache[RANGE_COUNT] = {0, 0, 0, 0};
+
+// The asymptote is a property of the range + leakage path, which depends on the
+// DC bias applied to the DUT.  Any change to the bias state must discard the
+// cache, or a reading taken at a new bias would be scaled by the old plateau.
+static void invalidate_vinf_cache(void)
+{
+    for (int i = 0; i < RANGE_COUNT; ++i) g_v_inf_cache[i] = 0;
+}
 
 // --- Least-squares exponential fit of the RC charge curve -----------------
 // The charge follows V(t) = V_inf·(1 − e^(−t/τ)), so
@@ -962,7 +1145,8 @@ static int adc_asymptote_for_range(uint8_t range_idx, int v_start)
     }
     gpio_set_level(DRIVE_PIN, 0);
 
-    // Re-discharge so the caller starts from a clean 0 V.
+    // Reset V_cap to ~0 V (drive low) without disturbing the DUT bias, then
+    // isolate so the caller starts the timed charge from a clean node.
     prepare_measurement();
     if (v_inf > 0) g_v_inf_cache[range_idx] = v_inf;
     return v_inf;
@@ -983,9 +1167,9 @@ static sample_t measure_adc_range(uint8_t range_idx)
     esp_rom_delay_us(5);
     prepare_measurement();
 
-    // The discharge switch leaves a residual charge on high-resistance ranges;
-    // actively wait until the node is safely below the start threshold.  If it
-    // cannot bleed down in time the node starts charged and the tau is bogus.
+    // prepare_measurement() leaves V_cap driven low (the DUT bias is untouched);
+    // actively confirm the node is below the start threshold before the timed
+    // charge.  If it will not settle in time the tau would be bogus.
     if (!wait_for_start_threshold(range_idx)) {
         log_sample(g_phase, &s);
         return s;
@@ -1077,12 +1261,18 @@ static sample_t measure_adc_range(uint8_t range_idx)
     }
     gpio_set_level(DRIVE_PIN, 0);
 
-    // Effective parallel resistance from the measured asymptote (divider droop).
+    // ---- Effective series resistance ----
+    // R_series (buffer Zo + mux Ron + wiring) is a large fraction of R_nom on
+    // the 100 Ω / 1 kΩ ranges.  When calibrated, use the measured effective
+    // resistance; otherwise fall back to nominal.  Fold in the parallel leakage
+    // path implied by the measured asymptote droop.
     double r_range = RANGES[range_idx].resistance_ohms;
-    double r_leak = ((double)v_inf * r_range) / ((double)V_NOMINAL_MV - (double)v_inf + 1e-9);
-    double r_eff = r_range;
+    double r_chain = adc_cal_valid(range_idx) ? adc_r_eff(range_idx) : r_range;
+    if (r_chain <= 0.0) r_chain = r_range;
+    double r_leak = ((double)v_inf * r_chain) / ((double)V_NOMINAL_MV - (double)v_inf + 1e-9);
+    double r_eff = r_chain;
     if (v_inf < V_NOMINAL_MV - 50 && r_leak > 0.0) {
-        r_eff = (r_range * r_leak) / (r_range + r_leak); // parallel
+        r_eff = (r_chain * r_leak) / (r_chain + r_leak); // parallel
     }
 
     double tau_us = -1.0;
@@ -1109,39 +1299,39 @@ static sample_t measure_adc_range(uint8_t range_idx)
         return s; // never crossed: too large for this range
     }
 
+    // True effective τ: the fallback crossing interval must be divided by the
+    // log factor.  Storing the effective τ (not the raw interval) lets ADC
+    // calibration reuse this exact estimator.
+    double tau_eff_us = used_fit ? tau_us : (tau_us / fallback_k_corr);
+
     // Stream the captured charge curve + fitted exponential for the UI graph.
     evt_curve(range_idx, v_inf, used_fit ? tau_us : -1.0,
               used_fit ? fit_r2 : -1.0, ts, mvs, npts);
 
     s.valid = true;
-    s.tau_us = tau_us;
+    s.tau_us = tau_eff_us;
     s.fit_r2 = fit_r2;
 
-    // Recover C_eq.  Fitted path: τ_eff = r_eff · C_eq.  Fallback path: the
-    // crossing interval must be divided by the log factor to recover τ_eff.
-    double c_eq;
-    if (used_fit) {
-        c_eq = (tau_us * 1e-6) / r_eff;
-    } else {
-        c_eq = (tau_us * 1e-6) / (r_eff * fallback_k_corr);
-    }
+    // Recover C_eq = τ_eff / R_eff.
+    double c_eq = (tau_eff_us * 1e-6) / r_eff;
     s.c_eq_f = c_eq;
 
     // Correct order: invert the C_block series combination FIRST, THEN subtract
-    // the parallel stray capacitance.  c_eq ≥ C_block is non-physical → reject.
+    // the node offset.  c_eq ≥ C_block is non-physical → reject.
     double c_total = cblock_invert(c_eq);
     if (c_total < 0.0) {                                  // at/past C_block singularity
         s.capacitance_f = 0.0;
         log_sample(g_phase, &s);
         return s;                                         // not plausible, not valid data
     }
-    double c = c_total - STRAY_CAPACITANCE_F;
+    double c_off = adc_cal_valid(range_idx) ? adc_c0(range_idx) : STRAY_CAPACITANCE_F;
+    double c = c_total - c_off;
     if (c < 0.0) c = 0.0;
     s.capacitance_f = c;
 
     // ---- Physics-based plausibility ----
-    if (tau_us < ADC_STEP_THRESHOLD_US) { log_sample(g_phase, &s); return s; } // poll jitter
-    if (tau_us > 15e6)                  { log_sample(g_phase, &s); return s; } // beyond timeout
+    if (tau_eff_us < ADC_STEP_THRESHOLD_US) { log_sample(g_phase, &s); return s; } // poll jitter
+    if (tau_eff_us > 15e6)                  { log_sample(g_phase, &s); return s; } // beyond timeout
     if (c < 3.0 * STRAY_CAPACITANCE_F)  { log_sample(g_phase, &s); return s; } // stray-dominated
     if (c > 1.0)                        { log_sample(g_phase, &s); return s; } // > 1 F here
     s.plausible = true;
@@ -1150,7 +1340,7 @@ static sample_t measure_adc_range(uint8_t range_idx)
     // Plateau of full confidence for 200 µs ≤ τ ≤ 20 ms; Gaussian roll-off
     // outside.  Fast τ is penalised hard (ADC poll jitter), slow τ gently
     // (still a clean measurement, just slower).
-    double log_tau = log(tau_us);
+    double log_tau = log(tau_eff_us);
     double q_time;
     if (log_tau >= log(200.0) && log_tau <= log(20000.0)) {
         q_time = 1.0;
@@ -1182,21 +1372,31 @@ static sample_t measure_adc_range(uint8_t range_idx)
 }
 
 // ---------------------------------------------------------------------------
-// Method 2 — LM393 self-oscillating relaxation oscillator, frequency readout
+// Method 2 — LM393 + ESP32 GPIO-feedback relaxation oscillator, frequency readout
 //
-// The LM393 hysteresis network makes the RC node free-run in hardware; the
-// ESP32 only OBSERVES the edges.  High frequencies are counted with the PCNT
-// peripheral over a fixed gate; low frequencies use a reciprocal period
-// measurement (N rising edges / elapsed time) via the GPIO ISR.  A quick PCNT
-// gate first decides which regime we are in.
+// The ESP32 mirrors the comparator output back onto the drive via the ISR, so
+// the RC node self-oscillates in a software-in-the-loop arrangement (this
+// board's LM393 is a plain comparator, not a free-running oscillator).  High
+// frequencies are counted with the PCNT peripheral over a fixed gate; low
+// frequencies use a reciprocal period measurement (N rising edges / elapsed
+// time) via the GPIO ISR.  A quick PCNT gate first decides which regime.
 // ---------------------------------------------------------------------------
 #define OSC_PCNT_QUICK_GATE_MS 20
-#define OSC_PCNT_GATE_MS 200
+// High-frequency path (100 kΩ small caps ~73 kHz): a long averaging window.
+// Counts are accumulated in short sub-gates so the 16-bit hardware counter can
+// never overflow, which lets the window be far longer than 32767/f would allow.
+#define OSC_PCNT_GATE_MS 500
+#define OSC_PCNT_SUBGATE_MS 25
 #define OSC_HIGH_FREQ_HZ 10000.0
-#define OSC_PERIOD_MAX_EDGES 64
-#define OSC_PERIOD_TIMEOUT_US 2000000LL
+// Reciprocal path (1 MΩ small caps ~7 kHz): average over a fixed long window
+// (0.5 s) instead of a fixed tiny edge count (was 64 edges ≈ 8.7 ms).
+#define OSC_PERIOD_MAX_EDGES 8192
+#define OSC_PERIOD_MIN_WINDOW_US 500000LL    // 0.5 s minimum averaging window
+#define OSC_PERIOD_TIMEOUT_US 3000000LL      // ...but never longer than 3 s
 
 // Count edges in hardware over a gate; returns frequency via *freq_hz.
+// The count is accumulated across sub-gates so the 16-bit PCNT (high_limit
+// 32767) can never overflow, enabling an arbitrarily long averaging window.
 static bool osc_pcnt_frequency(uint32_t gate_ms, double *freq_hz, uint32_t *count_out)
 {
     if (pcnt_unit_stop(pcnt_unit) != ESP_OK) return false;
@@ -1204,38 +1404,61 @@ static bool osc_pcnt_frequency(uint32_t gate_ms, double *freq_hz, uint32_t *coun
     if (pcnt_unit_start(pcnt_unit) != ESP_OK) return false;
 
     int64_t t0 = esp_timer_get_time();
-    vTaskDelay(pdMS_TO_TICKS(gate_ms));
+    int64_t deadline = t0 + (int64_t)gate_ms * 1000;
+    uint32_t sub_ms = (gate_ms < OSC_PCNT_SUBGATE_MS) ? gate_ms : OSC_PCNT_SUBGATE_MS;
+    if (sub_ms == 0) sub_ms = 1;
+    int64_t total = 0;
+
+    while (true) {
+        service_console();                       // honour stop/abort promptly
+        if (g_abort_cycle) { pcnt_unit_stop(pcnt_unit); return false; }
+        if (!osc_running) { pcnt_unit_stop(pcnt_unit); return false; } // self-limited
+        int64_t now = esp_timer_get_time();
+        if (now >= deadline) break;
+
+        int64_t remain_ms = (deadline - now) / 1000;
+        uint32_t chunk = sub_ms;
+        if ((int64_t)chunk > remain_ms) chunk = (uint32_t)(remain_ms > 0 ? remain_ms : 1);
+        vTaskDelay(pdMS_TO_TICKS(chunk));
+
+        // Sample-and-reset: one edge lost per sub-gate boundary is negligible
+        // (≈0.05 % at 500 ms / 73 kHz) and keeps the counter from overflowing.
+        int c = 0;
+        if (pcnt_unit_get_count(pcnt_unit, &c) != ESP_OK) { pcnt_unit_stop(pcnt_unit); return false; }
+        if (c < 0 || c >= 31100) { pcnt_unit_stop(pcnt_unit); return false; }  // overflow
+        total += c;
+        pcnt_unit_clear_count(pcnt_unit);
+        esp_task_wdt_reset();
+    }
+    pcnt_unit_stop(pcnt_unit);
     int64_t t1 = esp_timer_get_time();
 
-    pcnt_unit_stop(pcnt_unit);
-    int count = 0;
-    if (pcnt_unit_get_count(pcnt_unit, &count) != ESP_OK) return false;
-
-    // Overflow guard: the unit wraps at the configured high_limit (32767).  A
-    // count within 5% of that is untrustworthy (the gate is not accumulative).
-    if (count >= 31100) return false;
-
     double elapsed_us = (double)(t1 - t0);
-    if (elapsed_us <= 0.0 || count <= 0) return false;
+    if (elapsed_us <= 0.0 || total <= 0) return false;
 
-    *freq_hz = ((double)count * 1e6) / elapsed_us;
-    if (count_out) *count_out = (uint32_t)count;
+    *freq_hz = ((double)total * 1e6) / elapsed_us;
+    if (count_out) *count_out = (uint32_t)total;
     return true;
 }
 
-// Reciprocal period measurement: average N rising-edge intervals.
+// Reciprocal period measurement: average over a long, fixed time window (with
+// an edge ceiling) so ISR timestamp jitter averages down.
 static bool osc_period_frequency(double *freq_hz, uint32_t *periods_out)
 {
+    // The caller owns the loop lifetime (osc_loop_start() already primed and
+    // enabled it); we only reset the edge bookkeeping for this window.
     osc_edge_count = 0;
     osc_first_rise_time = 0;
     osc_last_rise_time = 0;
-    osc_running = true;
 
     int64_t t0 = esp_timer_get_time();
     while (true) {
         int64_t now = esp_timer_get_time();
+        if (!osc_running) break;   // ISR self-limited: loop was too fast
         if (osc_edge_count >= OSC_PERIOD_MAX_EDGES) break;
         if ((now - t0) >= OSC_PERIOD_TIMEOUT_US) break;
+        // Enough edges AND a full averaging window -> stop.
+        if (osc_edge_count >= 4 && (now - t0) >= OSC_PERIOD_MIN_WINDOW_US) break;
         if (g_abort_cycle) break;
         esp_task_wdt_reset();
         service_console();
@@ -1273,6 +1496,31 @@ static bool osc_measure_frequency(double *freq_hz, uint32_t *periods_out)
     return osc_period_frequency(freq_hz, periods_out);
 }
 
+// Frequency read used by tare and calibration.  It MUST use the identical
+// path/window as measure_osc_range() (i.e. osc_measure_frequency): the old tare
+// used dbg_measure_freq()'s 20 ms PCNT gate while the measurement uses the
+// 500 ms reciprocal window on 1 MΩ, and the two estimators differ by a fixed
+// few µs.  That constant period difference survived the "tare" subtraction and
+// showed up as ~3 pF on an open socket (a 10 pF DUT read ~12.8 pF).  Primes the
+// software loop first and stops it afterwards.
+static bool osc_read_freq(double *freq_hz, uint32_t *periods_out)
+{
+    osc_loop_start();
+    bool ok = osc_measure_frequency(freq_hz, periods_out);
+    osc_running = false;
+    return ok;
+}
+
+// A range is "tareable" only where an EMPTY socket still oscillates at a sane
+// rate.  On 100 Ω / 1 kΩ the bare node runs far too fast, so the software loop
+// self-limits and there is nothing to tare — but those ranges are still valid
+// for MEASUREMENT when a large DUT slows the loop down (that is why there is no
+// blanket range ban in measure_osc_range).
+static bool osc_range_tareable(uint8_t range_idx)
+{
+    return RANGES[range_idx].resistance_ohms >= 100000.0;
+}
+
 static sample_t measure_osc_range(uint8_t range_idx)
 {
     sample_t s = {
@@ -1285,15 +1533,15 @@ static sample_t measure_osc_range(uint8_t range_idx)
     esp_rom_delay_us(5);
     prepare_measurement();
 
-    // Kick-start the software-in-the-loop oscillator.  After
-    // prepare_measurement() the node is discharged (V_cap ≈ 0).  We prime the
+    // Kick-start the software-in-the-loop oscillator.  prepare_measurement()
+    // leaves V_cap reset to ~0 V (DUT bias untouched).  We prime the
     // drive with the comparator's CURRENT output level; the ISR then mirrors
     // the comparator onto the buffer on every edge and the loop self-sustains.
     // (This board's LM393 is a comparator, not a free-running oscillator —
-    // the ESP32 feedback is what makes it oscillate.)
-    osc_running = true;
-    uint32_t comp_state = (uint32_t)gpio_get_level(LM393_OUT_PIN);
-    gpio_set_level(DRIVE_PIN, comp_state);
+    // the ESP32 feedback is what makes it oscillate.)  If the loop is too fast
+    // for this range the ISR self-limits and osc_measure_frequency() fails,
+    // which simply rejects the sample.
+    osc_loop_start();
 
     double freq_hz = 0.0;
     uint32_t n_periods = 0;
@@ -1316,16 +1564,22 @@ static sample_t measure_osc_range(uint8_t range_idx)
     // stray removal below so an un-calibrated board behaves as before.
     double period_us = 1e6 / freq_hz;
     bool use_t0 = osc_has_t0(range_idx);
-    double eff_period_us = period_us - (use_t0 ? osc_t0(range_idx)
-                                               : osc_delay(range_idx));
+    double off_us = use_t0 ? osc_t0(range_idx) : osc_delay(range_idx);
+    double eff_period_us = period_us - off_us;
 
     // T_meas ≤ offset is non-physical (would imply a negative/zero RC time).
-    // Reject outright instead of clamping to a fake positive capacitance.
+    // Around a tare baseline, though, small negative excursions are just
+    // measurement noise: clamp them to 0 so an open socket reads ~0 pF instead
+    // of intermittently failing.  Only a large negative is truly non-physical.
     if (eff_period_us <= 0.0) {
-        s.freq_hz = freq_hz;
-        s.tau_us = period_us;
-        log_sample(g_phase, &s);
-        return s;                                             // invalid
+        if (use_t0 && off_us > 0.0 && eff_period_us > -0.05 * off_us) {
+            eff_period_us = 0.0;
+        } else {
+            s.freq_hz = freq_hz;
+            s.tau_us = period_us;
+            log_sample(g_phase, &s);
+            return s;                                         // invalid
+        }
     }
 
     s.valid = true;
@@ -1354,10 +1608,9 @@ static sample_t measure_osc_range(uint8_t range_idx)
     if (freq_hz < OSC_MIN_F_HZ)          { log_sample(g_phase, &s); return s; } // too slow / leaky
     if (freq_hz > 1000000.0)             { log_sample(g_phase, &s); return s; } // too fast for comparator
     if (n_periods < 4)                   { log_sample(g_phase, &s); return s; } // too few edges to trust
-    // Noise floor: with a tare the parasitic C is removed, so the limit is the
-    // timing-noise resolution (sub-pF), NOT the old 6 pF stray fraction.  An
-    // un-tared range still uses the legacy floor.
-    double c_floor = use_t0 ? 0.5e-12 : 0.5 * STRAY_CAPACITANCE_F;
+    // Tared ranges can legitimately read down to ~0 pF (open socket), so there is
+    // no positive floor there; an un-tared range still uses the legacy floor.
+    double c_floor = use_t0 ? 0.0 : 0.5 * STRAY_CAPACITANCE_F;
     if (c < c_floor)                     { log_sample(g_phase, &s); return s; }
     s.plausible = true;
 
@@ -1377,10 +1630,10 @@ static sample_t measure_osc_range(uint8_t range_idx)
     // is not available from a hardware-counted average).
     double q_count = (n_periods >= OSC_TARGET_PERIODS) ? 1.0
                      : 0.6 + 0.4 * ((double)n_periods / (double)OSC_TARGET_PERIODS);
-    // With a tare, small DUTs are credible: use a sub-pF noise reference rather
-    // than penalising every reading below ~36 pF as "stray-dominated".
-    double q_stray = use_t0 ? (c / (c + 0.5e-12))
-                            : (c / (c + 3.0 * STRAY_CAPACITANCE_F));
+    // Tared ranges have the parasitic offset removed, so there is no
+    // stray-domination penalty — a ~0 pF open-socket reading is legitimate and
+    // must not be crushed to zero quality.  Un-tared ranges keep the legacy term.
+    double q_stray = use_t0 ? 1.0 : (c / (c + 3.0 * STRAY_CAPACITANCE_F));
     s.quality = q_freq * q_count * q_stray;
 
     log_sample(g_phase, &s);
@@ -1740,6 +1993,15 @@ static void IRAM_ATTR dbg_isr(void *arg)
     (void)arg;
     dbg_isr_calls++;
     if (!osc_running) return;
+    // Same rate limit as the production ISR: never let the loop starve the CPU.
+    uint32_t now32 = (uint32_t)esp_timer_get_time();
+    if (osc_last_edge_us != 0 &&
+        (uint32_t)(now32 - osc_last_edge_us) < OSC_MIN_EDGE_INTERVAL_US) {
+        osc_running = false;
+        gpio_set_level(DRIVE_PIN, 0);
+        return;
+    }
+    osc_last_edge_us = now32;
     uint32_t state = (uint32_t)gpio_get_level(LM393_OUT_PIN);
     gpio_set_level(DRIVE_PIN, state);   // close the loop
     dbg_edges++;
@@ -1781,42 +2043,10 @@ static void dbg_print_state(int range_idx)
     printf("-----------------\n\n");
 }
 
-// Measure the current oscillation frequency on the selected range.
-// Uses an adaptive gate: start short so high frequencies never overflow the
-// 32767-count PCNT limit, and lengthen only if the count is too low to be
-// accurate.  Returns Hz, or -1 on no-signal/overflow-unsafe.
-static double dbg_measure_freq(void)
-{
-    static const uint32_t gates_ms[] = {20, 50, 200, 500};
-    for (size_t gi = 0; gi < sizeof(gates_ms) / sizeof(gates_ms[0]); ++gi) {
-        pcnt_unit_stop(pcnt_unit);
-        pcnt_unit_clear_count(pcnt_unit);
-        pcnt_unit_start(pcnt_unit);
-        int64_t t0 = esp_timer_get_time();
-        vTaskDelay(pdMS_TO_TICKS(gates_ms[gi]));
-        int64_t t1 = esp_timer_get_time();
-        pcnt_unit_stop(pcnt_unit);
-        int cnt = 0;
-        pcnt_unit_get_count(pcnt_unit, &cnt);
-        if (t1 <= t0) return -1.0;
-        if (cnt >= 31100) return -1.0;          // overflow-unsafe: refuse to trust
-        if (cnt <= 2) {
-            if (gi + 1 < sizeof(gates_ms) / sizeof(gates_ms[0])) continue; // too few edges, lengthen
-            return -1.0;                        // no oscillation even at longest gate
-        }
-        double f = (double)cnt * 1e6 / (double)(t1 - t0);
-        // If the shortest gate already overflowed-safe but count is healthy, accept.
-        // If count is small, prefer a longer gate for resolution.
-        if (cnt >= 20 || gi + 1 == sizeof(gates_ms) / sizeof(gates_ms[0])) return f;
-    }
-    return -1.0;
-}
-
 static void dbg_start(void)
 {
     dbg_edges = 0;
-    osc_running = true;
-    gpio_set_level(DRIVE_PIN, (uint32_t)gpio_get_level(LM393_OUT_PIN));
+    osc_loop_start();
 }
 
 static void dbg_stop(void)
@@ -1835,7 +2065,7 @@ static void dbg_probe_range(int range_idx)
 {
     select_mux_channel(RANGES[range_idx].mux_channel);
     esp_rom_delay_us(5);
-    prepare_measurement();          // discharge node via SSR2 clamp
+    prepare_measurement();          // isolate only; the DUT stays at its bias
 
     // Scale the sampling to the range: a 1 MΩ range needs a long window to see
     // any movement on a modest cap, while a 100 Ω range moves in µs.
@@ -1917,16 +2147,14 @@ static double g_cal_f1 = 0.0;
 static double g_cal_ref1 = 0.0;
 
 // Capture one calibration point (frequency at a known reference) on the
-// current range.  Returns the measured frequency, or -1 on failure.
+// current range.  Returns the measured frequency, or -1 on failure.  Uses the
+// same frequency path as the measurement (osc_read_freq) so the calibrated K
+// and the runtime measurement stay consistent.
 static double dbg_capture_point(int range_idx, double ref_pf, double *ref_c_out)
 {
     *ref_c_out = ref_pf * 1e-12;
-    bool was = osc_running;
-    if (!was) dbg_start();
-    vTaskDelay(pdMS_TO_TICKS(60));      // let the loop settle
-    double f = dbg_measure_freq();
-    if (!was) dbg_stop();
-    if (f <= 0.0) {
+    double f = 0.0;
+    if (!osc_read_freq(&f, NULL) || f <= 0.0) {
         printf(">> no oscillation / unsafe count on %s (check loop on scope)\n",
                RANGES[range_idx].label);
         return -1.0;
@@ -1935,49 +2163,64 @@ static double dbg_capture_point(int range_idx, double ref_pf, double *ref_c_out)
     return f;
 }
 
+#define TARE_SAMPLES 5   // each sample is already a ~500 ms averaged period
+
 // Tare the open-node offset T0.  With the DUT socket EMPTY, average several
 // oscillator periods and store T0 ≈ K·R·C_stray + latency.  Subtracting T0 in
 // the measurement removes the parasitic capacitance, which is the whole point
-// of sub-nF operation.  range_or_all < 0 => every range (low-R ranges usually
-// oscillate too fast to tare and are skipped with a message).
+// of sub-nF operation.  range_or_all < 0 => every tareable range.
+//
+// Safety: the ISR self-limits if the loop is too fast, and the loop is disabled
+// while the front-end is reconfigured and its prior state restored afterwards,
+// so this is safe to run while autoranging or from the debug console.  'zeroall'
+// skips the 100 Ω / 1 kΩ ranges because an EMPTY socket there self-limits (the
+// bare node is far too fast); an explicit single-range tare still tries.
 static void dbg_tare(int range_or_all)
 {
     int first = (range_or_all < 0) ? 0 : range_or_all;
     int last  = (range_or_all < 0) ? RANGE_COUNT - 1 : range_or_all;
+    bool restore_run = osc_running;   // free-run state to restore afterwards
 
     for (int r = first; r <= last; ++r) {
-        bool was = osc_running;
-        dbg_stop();
+        if (range_or_all < 0 && !osc_range_tareable((uint8_t)r)) {
+            printf(">> %s: skipped for tare (empty socket runs too fast here; "
+                   "tare only the 100 kΩ / 1 MΩ ranges)\n", RANGES[r].label);
+            continue;   // no telemetry: this range was not tared
+        }
+
+        osc_running = false;            // stop any prior loop unconditionally
         select_mux_channel(RANGES[r].mux_channel);
         esp_rom_delay_us(5);
-        prepare_measurement();          // discharge the node first
-        if (!was) dbg_start();
-        vTaskDelay(pdMS_TO_TICKS(60));  // let the loop settle
+        prepare_measurement();          // isolate only; keep the DUT bias
+        vTaskDelay(pdMS_TO_TICKS(60));  // let the node settle
 
         double acc = 0.0;
         int got = 0;
         double k = osc_k((uint8_t)r);
         double r_ohm = RANGES[r].resistance_ohms;
-        for (int kk = 0; kk < 8; ++kk) {
-            double f = dbg_measure_freq();
-            if (f > 0.0) {
+        for (int kk = 0; kk < TARE_SAMPLES; ++kk) {
+            // Same frequency path as the runtime measurement (500 ms reciprocal
+            // on 1 MΩ) so T0 subtracts the exact estimator the measurement uses.
+            double f = 0.0;
+            uint32_t nper = 0;
+            if (osc_read_freq(&f, &nper) && f > 0.0) {
                 acc += 1e6 / f;
                 got++;
                 // Live tare sample for the UI strip chart (running mean).
                 double mean = acc / (double)got;
                 double stray = (k * r_ohm > 0.0)
                                    ? (mean * 1e-6) / (k * r_ohm) * 1e12 : 0.0;
-                evt_tare(r, kk, 8, f, mean, stray, 0);
+                evt_tare(r, kk, TARE_SAMPLES, f, mean, stray, 0);
             }
             esp_task_wdt_reset();
             vTaskDelay(pdMS_TO_TICKS(10));
         }
-        if (!was) dbg_stop();
+        osc_running = false;
 
         if (got == 0) {
-            printf(">> %s: no oscillation with socket empty "
-                   "(range too fast / unusable for tare)\n", RANGES[r].label);
-            evt_tare(r, 8, 8, 0.0, 0.0, 0.0, 1);
+            printf(">> %s: no oscillation with socket empty (check the loop)\n",
+                   RANGES[r].label);
+            evt_tare(r, TARE_SAMPLES, TARE_SAMPLES, 0.0, 0.0, 0.0, 1);
             continue;
         }
         double period = acc / (double)got;
@@ -1989,8 +2232,13 @@ static void dbg_tare(int range_or_all)
         printf(">> %s TARE: T0 = %.2f us  (implied parasitic C = %.1f pF)  %s\n",
                RANGES[r].label, period, stray_pf,
                (e == ESP_OK) ? "saved to NVS" : "NVS SAVE FAILED");
-        evt_tare(r, 8, 8, got > 0 ? 1e6 / period : 0.0, period, stray_pf, 1);
+        evt_tare(r, TARE_SAMPLES, TARE_SAMPLES,
+                 period > 0.0 ? 1e6 / period : 0.0, period, stray_pf, 1);
     }
+
+    // Restore the loop state the caller had (debug 'g' leaves it free-running).
+    if (restore_run) dbg_start();
+    else dbg_stop();
 }
 
 // 'cal <ref_pF>'        — one-point: solve K (uses T0 if tared), C_eq-consistent.
@@ -2071,6 +2319,105 @@ static void dbg_calibrate(int range_idx, const char *cmd, double ref_pf)
 }
 
 // ---------------------------------------------------------------------------
+// ADC (RC-step) calibration commands
+// ---------------------------------------------------------------------------
+// Capture the effective τ on a range using the exact runtime path, so the
+// solved R_eff matches what measure_adc_range() will later apply.
+static double adc_capture_point(int range_idx, double ref_pf, double *ref_c_out)
+{
+    *ref_c_out = ref_pf * 1e-12;
+    sample_t s = measure_adc_range((uint8_t)range_idx);
+    if (!s.valid || s.tau_us <= 0.0) {
+        printf(">> ADC: no usable τ on %s (reference out of the clean window?)\n",
+               RANGES[range_idx].label);
+        return -1.0;
+    }
+    printf(">> ADC point: %s ref=%.4g pF  tau=%.1f us  R2=%.3f\n",
+           RANGES[range_idx].label, ref_pf, s.tau_us, s.fit_r2);
+    return s.tau_us;
+}
+
+static bool   g_adccal_pending = false;
+static int    g_adccal_range = -1;
+static double g_adccal_tau1 = 0.0;
+static double g_adccal_ref1 = 0.0;
+
+// 'adccal <ref_pF>'                      — one-point: R_eff = τ/C_ref
+// 'adccal1 <ref_pF>' then 'adccal2 <ref_pF>' — two-point: R_eff AND C0
+static void dbg_adccal(int range_idx, const char *cmd, double ref_pf)
+{
+    bool two_first  = (strncmp(cmd, "adccal1", 7) == 0);
+    bool two_second = (strncmp(cmd, "adccal2", 7) == 0);
+
+    if (two_first) {
+        double ref_c;
+        double tau = adc_capture_point(range_idx, ref_pf, &ref_c);
+        if (tau <= 0.0) { g_adccal_pending = false; return; }
+        g_adccal_pending = true;
+        g_adccal_range = range_idx;
+        g_adccal_tau1 = tau;
+        g_adccal_ref1 = ref_c;
+        evt_adccalpt(range_idx, "adccal1", ref_pf, tau);
+        printf(">> ADC point 1 captured on %s. Fit a DIFFERENT reference and run "
+               "'adccal2 <ref_pF>'.\n", RANGES[range_idx].label);
+        return;
+    }
+
+    if (two_second) {
+        if (!g_adccal_pending || g_adccal_range != range_idx) {
+            printf(">> no pending ADC point-1 for %s. Run 'adccal1 <ref_pF>' first.\n",
+                   RANGES[range_idx].label);
+            return;
+        }
+        double ref_c2;
+        double tau2 = adc_capture_point(range_idx, ref_pf, &ref_c2);
+        if (tau2 <= 0.0) { g_adccal_pending = false; return; }
+        evt_adccalpt(range_idx, "adccal2", ref_pf, tau2);
+
+        double r_eff, c0;
+        if (!adc_cal_solve_two(g_adccal_tau1, g_adccal_ref1, tau2, ref_c2, &r_eff, &c0)) {
+            printf(">> ADC CAL FAILED: two-point solve rejected (refs too similar / non-physical).\n");
+            evt_adccalres(range_idx, "two", 0.0, 0.0, 0);
+            g_adccal_pending = false;
+            return;
+        }
+        g_adc_cal[range_idx].r_eff_ohm = r_eff;
+        g_adc_cal[range_idx].c0_f = c0;
+        g_adc_cal[range_idx].valid = true;
+        esp_err_t e = adc_cal_save();
+        printf(">> %s ADC TWO-POINT: R_eff=%.2f Ω (nom %.0f, +%.2f series)  C0=%.1f pF  %s\n",
+               RANGES[range_idx].label, r_eff, RANGES[range_idx].resistance_ohms,
+               r_eff - RANGES[range_idx].resistance_ohms, c0 * 1e12,
+               (e == ESP_OK) ? "saved to NVS" : "NVS SAVE FAILED");
+        evt_adccalres(range_idx, "two", r_eff, c0, 1);
+        g_adccal_pending = false;
+        return;
+    }
+
+    // One-point: R_eff = τ / C_ref, offset seeded from the oscillator tare.
+    double ref_c;
+    double tau = adc_capture_point(range_idx, ref_pf, &ref_c);
+    if (tau <= 0.0) return;
+    evt_adccalpt(range_idx, "adccal", ref_pf, tau);
+    double r_eff = (tau * 1e-6) / ref_c;
+    if (r_eff <= 1.0 || r_eff > 1e7) {
+        printf(">> ADC CAL FAILED: bad R_eff (%.2f Ω).\n", r_eff);
+        evt_adccalres(range_idx, "one", 0.0, 0.0, 0);
+        return;
+    }
+    double c0 = node_stray_estimate_f((uint8_t)range_idx);
+    g_adc_cal[range_idx].r_eff_ohm = r_eff;
+    g_adc_cal[range_idx].c0_f = c0;
+    g_adc_cal[range_idx].valid = true;
+    esp_err_t e = adc_cal_save();
+    printf(">> %s ADC ONE-POINT: R_eff=%.2f Ω (nom %.0f, +%.2f series)  C0=%.1f pF (est)  %s\n",
+           RANGES[range_idx].label, r_eff, RANGES[range_idx].resistance_ohms,
+           r_eff - RANGES[range_idx].resistance_ohms, c0 * 1e12,
+           (e == ESP_OK) ? "saved to NVS" : "NVS SAVE FAILED");
+    evt_adccalres(range_idx, "one", r_eff, c0, 1);
+}
+
+// ---------------------------------------------------------------------------
 // Shared interactive console
 // ---------------------------------------------------------------------------
 static volatile bool g_in_hw_cmd = false;   // guards re-entrant exclusive cmds
@@ -2085,18 +2432,36 @@ static void console_help(void)
            "  single               measure one cycle then stop\n"
            "  precharge            SSR1+SSR3: charge C_block/N_DUT at V_BIAS (isolates after)\n"
            "  discharge            SSR2: bleed DUT/C_block to GND, then all SSRs off\n"
-           "  idle                 all SSRs off, drive low (safe to touch DUT)\n"
+           "  idle                 all SSRs off; discharges only if autodischarge is on\n"
+           "  autoprecharge on|off  measurement re-biases the DUT each cycle (default off)\n"
+           "  autodischarge on|off  bleed the node when a session ends (default off)\n"
+           "  auto?                show the auto-precharge / auto-discharge flags\n"
            "  auto                 normal mode: autorange (undo 'range')\n"
            "  range <0-3>          normal mode: lock a single range\n"
            "  zero                 tare T0 with socket EMPTY (removes parasitic C)\n"
-           "  zeroall              tare every usable range\n"
+           "  zeroall              tare 100 kΩ / 1 MΩ (oscillator ranges only)\n"
            "  cal <pF>             one-point K (uses T0 if tared)\n"
            "  cal1 <pF> | cal2 <pF> two-point K+T0 (2 different refs)\n"
-           "  cal?                 show calibration table\n"
-           "  calclear [0-3]       reset calibration (current range or given)\n"
+           "  cal?                 show oscillator calibration table\n"
+           "  calclear [0-3]       reset oscillator calibration (current range or given)\n"
+           "  adccal <pF>          one-point ADC R_eff from a known cap (100 Ω/1 kΩ)\n"
+           "  adccal1 <pF>|adccal2 <pF>  two-point ADC R_eff+C0\n"
+           "  adccal?              show ADC calibration table\n"
+           "  adccalclear [0-3]    reset ADC calibration (current range or given)\n"
            "  probe <0-3>          connectivity/charge probe of a range\n"
            "  stream on|off        emit @@EVT JSON telemetry\n"
            "  curve on|off         include full ADC charge curves in telemetry\n");
+}
+
+// Parse an on/off/1/0 argument.  Returns 1, 0, or -1 if unrecognised.
+static int parse_onoff(const char *s)
+{
+    while (*s == ' ' || *s == '\t') ++s;
+    if (!strncmp(s, "off", 3)) return 0;
+    if (!strncmp(s, "on", 2))  return 1;
+    if (s[0] == '1') return 1;
+    if (s[0] == '0') return 0;
+    return -1;
 }
 
 // Handle a hardware/calibration/telemetry command.  Returns true if recognised.
@@ -2106,13 +2471,14 @@ static bool console_handle_hw(const char *line)
 
     if (!strcmp(line, "help") || !strcmp(line, "h")) { console_help(); return true; }
 
-    if (!strcmp(line, "g")) { dbg_start(); printf(">> oscillator started\n"); return true; }
-    if (!strcmp(line, "s")) { dbg_stop();  printf(">> oscillator stopped\n"); return true; }
-    if (!strcmp(line, "r")) {
-        dbg_stop(); prepare_measurement(); dbg_start();
-        printf(">> discharged+restarted\n");
+    if (!strcmp(line, "g") || !strcmp(line, "r")) {
+        // Allowed on any range: the ISR self-limits if the loop is too fast.
+        if (!strcmp(line, "g")) { dbg_start(); printf(">> oscillator started\n"); }
+        else { dbg_stop(); prepare_measurement(); dbg_start();
+               printf(">> isolated+restarted\n"); }
         return true;
     }
+    if (!strcmp(line, "s")) { dbg_stop(); printf(">> oscillator stopped\n"); return true; }
 
     // ---- Front-end safety commands (exclusive; halt measurement first) ----
     if (!strcmp(line, "precharge")) {
@@ -2121,6 +2487,7 @@ static bool console_handle_hw(const char *line)
         fe_set(FE_PRECHARGE);
         front_end_idle();                    // start from a known-off state
         front_end_precharge();               // SSR1+SSR3 hold, then ISOLATE
+        invalidate_vinf_cache();             // bias changed: re-measure V_inf
         fe_set(FE_PRECHARGED);
         printf(">> PRE-CHARGE: N_DUT/C_block charged; SSR1+SSR3 released (isolated).\n"
                ">> WARNING: DUT may sit at up to 20 V bias. Run 'discharge' before removing it.\n");
@@ -2132,6 +2499,7 @@ static bool console_handle_hw(const char *line)
         fe_set(FE_DISCHARGE);
         front_end_discharge();               // SSR2 to GND for >= 5 tau
         front_end_idle();
+        invalidate_vinf_cache();             // bias changed: re-measure V_inf
         g_fe_charged = false; g_fe_discharged = true;
         fe_set(FE_IDLE);
         printf(">> DISCHARGE: DUT and C_block bled to GND; all SSRs off (IDLE).\n"
@@ -2141,10 +2509,35 @@ static bool console_handle_hw(const char *line)
     }
     if (!strcmp(line, "idle")) {
         g_run = false;
-        front_end_idle();
-        fe_set(FE_IDLE);
-        printf(">> IDLE: all SSRs off, drive low.\n");
-        evt_ack("idle", 1, "all SSRs off");
+        front_end_finish();                  // auto-discharge if armed, else isolate
+        printf(">> IDLE: all SSRs off, drive low.%s\n",
+               g_auto_discharge ? " Node discharged." : " Bias held (run 'discharge').");
+        evt_ack("idle", 1, g_auto_discharge ? "discharged + idle" : "isolated (bias held)");
+        return true;
+    }
+
+    // ---- Automation flags (default OFF => manual front-end control) ----
+    if (!strncmp(line, "autoprecharge", 13) || !strncmp(line, "autocharge", 10)) {
+        const char *arg = line + (line[4] == 'p' ? 13 : 10);
+        int v = parse_onoff(arg);
+        if (v < 0) { printf(">> usage: autoprecharge on|off\n"); }
+        else { g_auto_precharge = v;
+               invalidate_vinf_cache();
+               printf(">> auto-precharge %s\n", v ? "ON" : "OFF");
+               evt_fe(); evt_ack("autoprecharge", 1, v ? "on" : "off"); }
+        return true;
+    }
+    if (!strncmp(line, "autodischarge", 12)) {
+        int v = parse_onoff(line + 12);
+        if (v < 0) { printf(">> usage: autodischarge on|off\n"); }
+        else { g_auto_discharge = v;
+               printf(">> auto-discharge %s\n", v ? "ON" : "OFF");
+               evt_fe(); evt_ack("autodischarge", 1, v ? "on" : "off"); }
+        return true;
+    }
+    if (!strcmp(line, "auto?")) {
+        printf(">> auto-precharge=%s  auto-discharge=%s\n",
+               g_auto_precharge ? "on" : "off", g_auto_discharge ? "on" : "off");
         return true;
     }
 
@@ -2186,6 +2579,48 @@ static bool console_handle_hw(const char *line)
         double ref_pf = atof(line + 3);
         if (ref_pf <= 0.0) printf(">> usage: cal <ref_pF>\n");
         else dbg_calibrate(range_idx, line, ref_pf);
+        return true;
+    }
+
+    // ---- ADC (RC-step) series-resistance calibration ----
+    if (!strncmp(line, "adccal?", 7)) {
+        printf("\n--- ADC (RC-step) calibration ---\n");
+        for (int i = 0; i < RANGE_COUNT; ++i) {
+            if (g_adc_cal[i].valid) {
+                printf("  %-7s R_eff=%.2f Ω (nom %.0f, +%.2f series)  C0=%.1f pF  calibrated\n",
+                       RANGES[i].label, g_adc_cal[i].r_eff_ohm,
+                       RANGES[i].resistance_ohms,
+                       g_adc_cal[i].r_eff_ohm - RANGES[i].resistance_ohms,
+                       g_adc_cal[i].c0_f * 1e12);
+            } else {
+                printf("  %-7s R_eff=%.0f Ω (nominal)  default\n",
+                       RANGES[i].label, RANGES[i].resistance_ohms);
+            }
+        }
+        printf("---------------------------------\n\n");
+        return true;
+    }
+    if (!strncmp(line, "adccalclear", 11)) {
+        int rr = range_idx;
+        for (int i = 11; line[i]; ++i)
+            if (line[i] >= '0' && line[i] <= '3') { rr = line[i] - '0'; break; }
+        if (rr >= 0 && rr < RANGE_COUNT) {
+            g_adc_cal[rr] = (adc_cal_t){0.0, 0.0, false};
+            adc_cal_save();
+            printf(">> %s ADC calibration cleared to nominal\n", RANGES[rr].label);
+        }
+        return true;
+    }
+    if (!strncmp(line, "adccal1", 7) || !strncmp(line, "adccal2", 7)) {
+        double ref_pf = atof(line + 7);
+        if (ref_pf <= 0.0) printf(">> usage: %s <ref_pF>\n", line);
+        else dbg_adccal(range_idx, line, ref_pf);
+        return true;
+    }
+    if (!strncmp(line, "adccal", 6)) {
+        double ref_pf = atof(line + 6);
+        if (ref_pf <= 0.0) printf(">> usage: adccal <ref_pF>\n");
+        else dbg_adccal(range_idx, line, ref_pf);
         return true;
     }
 
@@ -2234,8 +2669,10 @@ static bool is_exclusive_cmd(const char *line)
         !strcmp(line, "idle")) return true;
     if (!strcmp(line, "zero") || !strcmp(line, "zeroall")) return true;
     if (!strncmp(line, "calclear", 8)) return true;
+    if (!strncmp(line, "adccalclear", 11)) return true;
     if (!strncmp(line, "probe", 5)) return true;
     if (!strncmp(line, "cal", 3) && strncmp(line, "cal?", 4) != 0) return true;
+    if (!strncmp(line, "adccal", 6) && strncmp(line, "adccal?", 7) != 0) return true;
     return false;
 }
 
@@ -2248,12 +2685,23 @@ static void console_dispatch(const char *line)
 // separate concern ('precharge'/'discharge'/'idle').  Stopping aborts any
 // in-flight cycle so the transition is prompt.
     if (!strcmp(line, "start")) { g_run = true; g_single_shot = false;
+                                  invalidate_vinf_cache();   // fresh session
                                   evt_ack("start", 1, "autoranging"); return; }
     if (!strcmp(line, "stop"))  { g_run = false;
-                                  if (g_measuring) g_abort_cycle = true;
-                                  fe_set(FE_IDLE);
-                                  evt_ack("stop", 1, "stopped; front-end isolated"); return; }
+                                  if (g_measuring) {
+                                      // Defer the front-end finish until the
+                                      // aborted cycle has fully unwound (the
+                                      // main loop drains this flag).
+                                      g_abort_cycle = true;
+                                      g_fe_finish_pending = true;
+                                  } else {
+                                      front_end_finish();
+                                  }
+                                  evt_ack("stop", 1, g_auto_discharge
+                                          ? "stopped; auto-discharged"
+                                          : "stopped; isolated (bias held)"); return; }
     if (!strcmp(line, "single")){ g_single_shot = true; g_run = true;
+                                  invalidate_vinf_cache();   // fresh session
                                   evt_ack("single", 1, "one cycle"); return; }
     if (!strcmp(line, "auto"))  { g_range_lock = -1; evt_ack("auto", 1, "autorange"); return; }
     if (!strncmp(line, "range", 5)) {
@@ -2335,6 +2783,7 @@ void app_main(void)
     // Reuse the standard bring-up (outputs, mux, PCNT) but install our own ISR.
     system_hw_init();
     osc_cal_load();
+    adc_cal_load();
     gpio_isr_handler_remove(LM393_OUT_PIN);
     gpio_isr_handler_add(LM393_OUT_PIN, dbg_isr, NULL);
 
@@ -2382,14 +2831,18 @@ void app_main(void)
                                                : osc_delay(g_console_range),
                    g_osc_cal[g_console_range].valid ? "cal" : "default",
                    osc_has_t0(g_console_range) ? " tared" : "");
+            // Resume a previously free-running oscillator on the new range; the ISR
+            // self-limits if the loop is too fast.
             if (was) dbg_start();
-        } else if (!strcmp(line, "g")) {
-            dbg_start(); printf(">> STARTED (drive=%d)\n", gpio_get_level(DRIVE_PIN));
+        } else if (!strcmp(line, "g") || !strcmp(line, "r")) {
+            if (!strcmp(line, "g")) {
+                dbg_start(); printf(">> STARTED (drive=%d)\n", gpio_get_level(DRIVE_PIN));
+            } else {
+                dbg_stop(); prepare_measurement(); dbg_start();
+                printf(">> isolated+restarted\n");
+            }
         } else if (!strcmp(line, "s")) {
             dbg_stop(); printf(">> STOPPED\n");
-        } else if (!strcmp(line, "r")) {
-            dbg_stop(); prepare_measurement(); dbg_start();
-            printf(">> discharged+restarted\n");
         } else {
             console_dispatch(line);
         }
@@ -2410,6 +2863,7 @@ void app_main(void)
 
     system_hw_init();
     osc_cal_load();
+    adc_cal_load();
 
     // Interactive command pump on UART0 — the same console the debug build uses,
     // so normal mode can tare/calibrate while autoranging.
@@ -2425,11 +2879,18 @@ void app_main(void)
                      g_osc_cal[i].valid ? "calibrated" : "default K",
                      g_osc_cal[i].has_t0 ? ", tared" : "");
         }
+        if (g_adc_cal[i].valid) {
+            ESP_LOGI(TAG, "  %s: ADC R_eff=%.2f Ω (nom %.0f, +%.2f series) C0=%.1f pF",
+                     RANGES[i].label, g_adc_cal[i].r_eff_ohm,
+                     RANGES[i].resistance_ohms,
+                     g_adc_cal[i].r_eff_ohm - RANGES[i].resistance_ohms,
+                     g_adc_cal[i].c0_f * 1e12);
+        }
     }
     printf("\n=== CAP METER (normal mode) ===\n"
            "Boots IDLE. Type 'h' for commands: start/stop/single, "
            "precharge/discharge/idle, range/auto, zero/zeroall, cal/cal1/cal2, "
-           "probe, stream/curve.\n"
+           "adccal/adccal1/adccal2, probe, stream/curve.\n"
            "Enable machine telemetry with 'stream on' (append 'curve on' for ADC curves).\n\n");
 
     // A full measurement cycle can take tens of seconds (large DUTs on the
@@ -2465,12 +2926,20 @@ void app_main(void)
         }
 
         if (!g_run) {
+            if (g_fe_finish_pending) {       // deferred finish after a 'stop'
+                g_fe_finish_pending = false;
+                front_end_finish();
+            }
             safe_delay_ms(100);
             continue;
         }
 
         if (g_fe_state != FE_MEASURING) {
-            g_fe_charged = true; g_fe_discharged = false;   // cycles bias C_block
+            // Only claim the DUT is "charged" if a bias is actually applied.
+            // With auto-precharge OFF and no manual precharge, the measurement
+            // runs unbiased and this must stay false or the dashboard safety
+            // warning lies about the front-end state.
+            if (g_auto_precharge) { g_fe_charged = true; g_fe_discharged = false; }
             fe_set(FE_MEASURING);
         }
 
@@ -2490,7 +2959,7 @@ void app_main(void)
         evt_cycle(&result);
 
         if (g_single_shot) { g_single_shot = false; g_run = false;
-                             fe_set(FE_IDLE); }
+                             front_end_finish(); }
 
         safe_delay_ms(1000);
     }

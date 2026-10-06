@@ -39,6 +39,11 @@ HIST = {
     "calres": deque(maxlen=500),
     "fe": deque(maxlen=1000),
     "ack": deque(maxlen=2000),
+    "adccalpt": deque(maxlen=2000),
+    "adccalres": deque(maxlen=500),
+    # Waveform snapshots are large; keep a short tail so a late/reconnecting
+    # client can still be handed the most recent curve.
+    "curve": deque(maxlen=50),
 }
 
 
@@ -67,7 +72,8 @@ class Hub:
         # State snapshot for late-joining clients / the REST endpoint.
         self.latest: dict = {"cycle": None, "boot": None, "tare": None,
                              "calres": None, "calpt": None, "fe": None,
-                             "ack": None}
+                             "ack": None, "adccalres": None, "adccalpt": None,
+                             "curve": None}
         self.curve_requested = False
 
     # ---- broadcast helpers -------------------------------------------------
@@ -84,13 +90,21 @@ class Hub:
 
     async def add_client(self, ws: WebSocket) -> None:
         self.clients.add(ws)
+        # Tell the client to clear its local state FIRST: we are about to replay
+        # history, and on a reconnect (same page) that would otherwise double-count
+        # cycles into the rolling average and duplicate calibration scatter points.
+        await ws.send_json({"type": "reset"})
         # Give the newcomer the full current picture, then live updates.
         await ws.send_json({"type": "status", **self.status})
         if self.latest["boot"]:
             await ws.send_json({"type": "event", "event": self.latest["boot"]})
         for kind, dq in HIST.items():
+            if kind == "curve":
+                continue  # large; sent once as a snapshot below
             for ev in list(dq)[-500:]:
                 await ws.send_json({"type": "event", "event": ev})
+        if self.latest["curve"]:
+            await ws.send_json({"type": "event", "event": self.latest["curve"]})
         for line in list(self.log_lines)[-200:]:
             await ws.send_json({"type": "log", "line": line})
 
@@ -100,8 +114,13 @@ class Hub:
     async def send_cmd(self, cmd: str) -> bool:
         if self.writer is None:
             return False
+        # Exactly one firmware command per call: take only the first line so a
+        # free-form console entry cannot inject several device commands at once.
+        cmd = cmd.replace("\r", "\n").split("\n", 1)[0].strip()
+        if not cmd:
+            return False
         try:
-            self.writer.write((cmd.rstrip("\n") + "\n").encode())
+            self.writer.write((cmd + "\n").encode())
             await self.writer.drain()
             return True
         except Exception as exc:  # noqa: BLE001
@@ -168,6 +187,7 @@ class Hub:
             if kind == "boot":
                 self.latest["boot"] = ev
             elif kind == "cycle":
+                ev.setdefault("rx_unix_s", time.time())   # host receive time
                 self.latest["cycle"] = ev
                 HIST["cycle"].append(ev)
             elif kind == "tare":
@@ -185,6 +205,15 @@ class Hub:
             elif kind == "ack":
                 self.latest["ack"] = ev
                 HIST["ack"].append(ev)
+            elif kind == "adccalres":
+                self.latest["adccalres"] = ev
+                HIST["adccalres"].append(ev)
+            elif kind == "adccalpt":
+                self.latest["adccalpt"] = ev
+                HIST["adccalpt"].append(ev)
+            elif kind == "curve":
+                self.latest["curve"] = ev
+                HIST["curve"].append(ev)
             elif kind == "sample":
                 HIST["sample"].append(ev)
             await self.broadcast({"type": "event", "event": ev})
@@ -222,9 +251,8 @@ def make_app(hub: Hub) -> FastAPI:
         w.writerow(["# cycles"])
         w.writerow(["rx_unix_s", "device_ts_ms", "valid", "c_F", "spread",
                     "weight", "n_adc", "n_osc", "raw", "adc_F", "osc_F", "mismatch"])
-        base = time.time()
         for ev in HIST["cycle"]:
-            w.writerow([f"{base:.3f}", ev.get("ts_ms"), ev.get("valid"),
+            w.writerow([f"{ev.get('rx_unix_s', 0.0):.3f}", ev.get("ts_ms"), ev.get("valid"),
                         ev.get("c"), ev.get("spread"), ev.get("weight"),
                         ev.get("n_adc"), ev.get("n_osc"), ev.get("raw"),
                         ev.get("adc"), ev.get("osc"), ev.get("mismatch")])

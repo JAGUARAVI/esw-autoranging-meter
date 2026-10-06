@@ -39,6 +39,7 @@ header {
 .btn:hover { border-color: #3b4657; background: #222a38; }
 .btn.small { padding: 4px 9px; font-size: 12px; text-decoration: none; }
 .btn.ghost { background: transparent; }
+.btn.on { border-color: rgba(74,222,128,.55); color: var(--accent); background: rgba(74,222,128,.12); }
 select.btn { padding: 6px 8px; }
 
 .readout { display: flex; gap: 20px; padding: 18px 20px; align-items: stretch; }
@@ -49,6 +50,12 @@ select.btn { padding: 6px 8px; }
 .big .label { color: var(--dim); font-size: 12px; text-transform: uppercase; letter-spacing: .8px; }
 .big .value { font-size: 40px; font-weight: 700; color: var(--accent); line-height: 1.15; }
 .big .meta { font-size: 12px; margin-top: 4px; }
+.avgsel {
+  margin-left: 10px; background: var(--panel2); color: var(--text);
+  border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px;
+  font-size: 11px; text-transform: none; letter-spacing: 0;
+}
+.avgsel:hover { border-color: #3b4657; }
 .stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; flex: 1; }
 .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; }
 .stat .k { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .5px; }
@@ -91,6 +98,9 @@ select.btn { padding: 6px 8px; }
 hr { border: none; border-top: 1px solid var(--line); margin: 12px 0; }
 .hint { font-size: 12px; margin-top: 8px; }
 .caltable { margin-top: 12px; font-size: 12px; color: var(--dim); white-space: pre-wrap; }
+.kicker { color: var(--accent2); font-size: 11px; text-transform: uppercase; letter-spacing: .8px; margin-bottom: 6px; }
+.calcplot { margin-top: 10px; }
+.calcplot svg { display: block; }
 
 .tablewrap { max-height: 320px; overflow: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 12px; }

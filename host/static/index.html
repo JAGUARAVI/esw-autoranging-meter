@@ -19,9 +19,18 @@
 
 <section class="readout">
   <div class="big">
-    <div class="label">Capacitance</div>
+    <div class="label">Capacitance
+      <select id="avgWindow" class="avgsel" title="Show a rolling average of the last N valid readings">
+        <option value="1">instant</option>
+        <option value="3">avg 3</option>
+        <option value="5" selected>avg 5</option>
+        <option value="10">avg 10</option>
+        <option value="20">avg 20</option>
+      </select>
+    </div>
     <div id="capValue" class="value mono">—</div>
     <div id="capMeta" class="meta dim">waiting for telemetry…</div>
+    <div id="capHistory" class="meta dim"></div>
   </div>
   <div class="stats">
     <div class="stat"><div class="k">Confidence</div><div id="conf" class="v mono">—</div></div>
@@ -77,6 +86,13 @@
     <button class="btn danger" id="btnPrecharge">Pre-charge C_block</button>
     <button class="btn" id="btnDischarge">Discharge</button>
     <button class="btn ghost" id="btnIdle">Idle (all off)</button>
+  </div>
+  <div class="safety-col actions">
+    <div class="k">Automation</div>
+    <button class="btn ghost" id="btnAutoPre">Auto pre-charge: OFF</button>
+    <button class="btn ghost" id="btnAutoDis">Auto discharge: OFF</button>
+    <div class="meta dim">Default OFF (manual). AUTO PRE re-biases the DUT before each
+      measurement cycle; AUTO DIS bleeds the node when a run ends.</div>
   </div>
 </section>
 <div id="feWarn" class="warn hidden"></div>
@@ -135,7 +151,9 @@
     </div>
     <div class="calrow">
       <button class="btn" id="btnTare">Tare (socket empty)</button>
-      <button class="btn" id="btnTareAll">Tare all</button>
+      <button class="btn" id="btnTareAll"
+        title="Tares the 100 kΩ and 1 MΩ oscillator ranges. The 100 Ω / 1 kΩ RC-step ranges are skipped: the relaxation oscillator there runs too fast for the ESP32 ISR.">
+        Tare all (100k / 1M)</button>
       <button class="btn ghost" id="btnCalTable">Show table</button>
       <button class="btn ghost" id="btnCalClear">Clear</button>
     </div>
@@ -157,6 +175,32 @@
     </div>
     <div class="hint dim">Tare removes the ~136 pF parasitic node capacitance. Two-point solves K and T0 together.</div>
     <div id="calTable" class="caltable mono"></div>
+
+    <hr />
+    <div class="kicker">ADC (RC-step) series resistance</div>
+    <div class="hint dim">R_eff = R_nom + buffer Zo + mux Ron + wiring. Big on 100 Ω / 1 kΩ.
+      References must put τ in the clean window: on 100 Ω use ~10–100 µF, on 1 kΩ use ~1–10 µF (low-ESR film).</div>
+    <div class="calrow">
+      <label>One-point</label>
+      <input id="adcRef1" class="mono" type="text" placeholder="e.g. 10u" />
+      <button class="btn" id="btnAdcCal1p">Cal R_eff</button>
+    </div>
+    <div class="calrow">
+      <label>Two-point</label>
+      <input id="adcRefA" class="mono" type="text" placeholder="ref1 e.g. 1u" />
+      <button class="btn" id="btnAdcCalA">Capture 1</button>
+    </div>
+    <div class="calrow">
+      <label>then</label>
+      <input id="adcRefB" class="mono" type="text" placeholder="ref2 e.g. 10u" />
+      <button class="btn" id="btnAdcCalB">Capture 2 (solve)</button>
+    </div>
+    <div class="calrow">
+      <button class="btn ghost" id="btnAdcCalTable">Show ADC table</button>
+      <button class="btn ghost" id="btnAdcCalClear">Clear ADC cal</button>
+    </div>
+    <div id="adcCalTable" class="caltable mono"></div>
+    <div id="adcCalChart" class="calcplot"></div>
   </div>
 
   <div class="card">

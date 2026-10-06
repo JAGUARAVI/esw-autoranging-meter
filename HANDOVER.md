@@ -17,7 +17,7 @@ The system now supports a hybrid measurement approach, automatically routing bas
 
 * **ADC RC-Step Mode (Large Capacitors):** Routes via `GPIO10` (ADC1 Channel 9). Measures the exponential charge curve up to the 2085 mV threshold ($1\tau$). Used primarily for µF-range electrolytics.
 * **Oscillator Mode (Small Capacitors):** Triggered automatically if the 1 MΩ range charges faster than 200 µs. Relies on an ISR attached to `GPIO14` to mirror the LM393 output state back to the drive pin, establishing a hardware-in-the-loop relaxation oscillator. Measures 50 full periods to calculate capacitance.
-* **Safety Sequencing:** Precharge and discharge phases strictly hold the system in a 0V differential state for 600 ms, discharging $C_{DUT}$ completely and allowing the dielectric to soak at the external $V_{bias}$ level before measurement.
+* **Bias-preserving measurement sequencing:** The measurement path **never closes SSR2**. Each range setup only resets the MCU-side $V_{cap}$ by driving it low, so a precharged $C_{DUT}$/$C_{block}$ stay at $V_{BIAS}$ through $R_{bias}$ and the DUT is measured *under* the set DC bias. With **auto-precharge** ON the path re-asserts PRE-CHARGE (SSR1+SSR3, SSR2 OFF) → ISOLATE before every reading; with it OFF the operator's manual `precharge` is preserved. The node is only bled by an explicit `discharge`, or automatically at end-of-session when **auto-discharge** is ON.
 
 ## 3. ESP32 Pin Mapping
 
@@ -54,6 +54,56 @@ The ADC is now hard-gated below ~1 nF (`ADC_SUBNF_GATE_F`): a 10 pF change on
 the 1 MΩ range is only ~10 µs of τ, below the sample-loop jitter, so small DUTs
 are measured by the tared oscillator only.
 
+**Oscillator frequency guard (not a range ban).** The relaxation oscillator is a
+*software* loop (the ESP32 ISR mirrors the LM393 output onto the drive buffer on
+every edge). The hazard is running it **too fast** for the ISR (e.g. a bare
+~136 pF node on 100 Ω / 1 kΩ runs at MHz and would freeze the device), not the
+range itself: a large cap on 100 Ω / 1 kΩ runs slowly and is a perfectly good
+oscillator reading. So `measure_osc_range` is allowed on **all** ranges, and the
+ISR carries a rate limiter (`OSC_MIN_EDGE_INTERVAL_US = 3`): if edges arrive
+faster than ~166 kHz the ISR shuts the loop down itself (`osc_loop_start()` /
+`osc_last_edge_us`), so it can never saturate the core. The affected sample is
+simply rejected as too fast; a good-quality reading on 100 Ω / 1 kΩ is used
+normally by the autoranger and fusion. `zeroall` still skips those two ranges
+(an empty socket is too fast to tare; T0 is negligible for the large caps that
+use them), and `dbg_tare` disables the loop while reconfiguring the front-end
+and restores the previous loop state afterwards, so it is safe while autoranging.
+
+**Longer averaging window (accuracy).** The high-frequency PCNT path now
+averages over `OSC_PCNT_GATE_MS = 500 ms`, accumulating counts in 25 ms
+sub-gates so the 16-bit counter can never overflow. The reciprocal path (1 MΩ
+small caps) now averages over a fixed `OSC_PERIOD_MIN_WINDOW_US = 500 ms`
+window (or up to `OSC_PERIOD_MAX_EDGES = 8192` / `OSC_PERIOD_TIMEOUT_US = 3 s`)
+instead of only 64 edges (~8.7 ms), so ISR timestamp jitter averages down.
+
+**ADC (RC-step) series-resistance calibration.** The RC-step measures
+`τ = R_eff·(C_dut + C0)` with `R_eff = R_nom + R_series` (buffer Zo + mux Ron +
+wiring). On the 100 Ω / 1 kΩ ranges `R_series` is a large fraction of `R_nom`
+(tens of ohms), so the ADC used to over-read C by `(R_nom+R_series)/R_nom`; the
+oscillator absorbed this in its calibrated `K`, but the ADC had no equivalent.
+The firmware now stores a measured `R_eff` and offset `C0` per range in NVS
+(`adc_cal` namespace) and applies them in `measure_adc_range()`. Calibrate with
+known low-ESR film references whose τ lands in the clean window
+(`ADC_STEP_THRESHOLD_US = 250 µs` … 20 ms): on 100 Ω use ~10–100 µF, on 1 kΩ use
+~1–10 µF. Commands: `adccal <pF>` (one-point `R_eff = τ/C_ref`, `C0` seeded from
+the oscillator tare), `adccal1 <pF>` then `adccal2 <pF>` (two-point, solves
+`R_eff` and `C0`), `adccal?`, `adccalclear [0-3]`. Calibration captures τ through
+the exact runtime path (`measure_adc_range`), and `s.tau_us` now holds the true
+effective τ (fallback-corrected) so calibration and measurement stay consistent.
+
+**Tare must use the measurement path.** `dbg_tare` and `dbg_capture_point`
+previously measured the period with `dbg_measure_freq()` (a 20 ms PCNT gate),
+while `measure_osc_range()` uses `osc_measure_frequency()` (quick PCNT, then a
+500 ms reciprocal window on 1 MΩ). The two estimators differed by a fixed few
+µs, so the difference survived the T0 subtraction and appeared as a constant
+offset — an open 1 MΩ socket read ~3 pF and a 10 pF DUT read ~12.8 pF (the
+*delta* was correct). Both now call `osc_read_freq()`, which primes the loop and
+uses `osc_measure_frequency()` — the identical path and window as the runtime
+measurement — so T0 cancels exactly. `dbg_measure_freq` was removed. Tared
+ranges also now allow a ~0 pF reading: small negative excursions around the tare
+baseline are clamped to 0 (not rejected), the tared noise floor is 0, and the
+tared `q_stray` term is 1.0 so an open socket reports ~0 pF instead of failing.
+
 ## 5. Interactive Normal Mode & Web Dashboard
 
 Normal mode (the default build, `OSC_DEBUG_MODE 0`) is now interactive as well
@@ -62,21 +112,34 @@ keeps measuring by default. Exclusive commands (`zero`, `cal*`, `probe`) abort
 the in-flight cycle at the next safe point and then run.
 
 Commands (type `h`): `start/stop/single`, `precharge`, `discharge`, `idle`,
-`auto`, `range <0-3>`, `zero`, `zeroall`, `cal <pF>`, `cal1/cal2 <pF>`, `cal?`,
-`calclear`, `probe <0-3>`, `status`, `stream on|off`, `curve on|off`.
+`autoprecharge on|off`, `autodischarge on|off`, `auto?`, `auto`, `range <0-3>`,
+`zero`, `zeroall`, `cal <pF>`, `cal1/cal2 <pF>`, `cal?`, `calclear`,
+`probe <0-3>`, `status`, `stream on|off`, `curve on|off`.
 
 Front-end power is deliberately **not** tied to `start`/`stop`. `start`/`stop`
-only gate autoranging; `precharge`/`discharge`/`idle` drive the SSRs. Every
-front-end command is exclusive: it aborts any in-flight cycle first, so the SSR
-state machine can never be driven concurrently with a measurement. The device
-**boots IDLE** (`g_run = false`) — it does not measure or charge until
-instructed. SSR1 (pre-charge) and SSR3 (V_cap clamp) share one GPIO, so charging
-always clamps V_cap. The firmware emits `@@EVT {"t":"fe",...}` with the state,
-SSR pin levels and `charged`/`discharged` flags for the dashboard.
+only gate autoranging; `precharge`/`discharge`/`idle` drive the SSRs. Toggling
+either automation flag from the dashboard is likewise non-exclusive. The device
+**boots IDLE** (`g_run = false`, both automation flags OFF) — it does not
+measure, charge, or discharge until instructed. SSR1 (pre-charge) and SSR3
+(V_cap clamp) share one GPIO, so charging always clamps V_cap.
+
+Automation flags (runtime, default **OFF**, not persisted):
+* `autoprecharge` / `autocharge` — when ON, every measurement re-biases the DUT
+  (`prepare_measurement()` runs PRE-CHARGE with SSR2 off, then ISOLATE). When
+  OFF, measurements never touch the bias and the operator must run `precharge`.
+* `autodischarge` — when ON, a session end (`single`, `stop`, `idle`) bleeds the
+  node; when OFF, those leave the bias held and require an explicit `discharge`.
+
+`cal*`/`adccal*`/`probe`/`zero` all keep the bias too (they call the same
+bias-preserving `prepare_measurement()`). The firmware emits
+`@@EVT {"t":"fe",...}` with the state, SSR pin levels, `charged`/`discharged`
+and `auto_pre`/`auto_dis` flags for the dashboard.
 
 Telemetry: with `stream on` the firmware prints single-line JSON after a
 `@@EVT ` sentinel (`boot`, `cycle`, `sample`, `curve`, `tare`, `calpt`,
-`calres`, `ack`); `curve on` adds the full ADC charge curve. Human `ESP_LOG`
+`calres`, `adccalpt`, `adccalres`, `fe`, `ack`); `curve on` adds the full ADC
+charge curve (the host stores the latest and replays it to reconnecting
+clients). Human `ESP_LOG`
 lines are emitted alongside and are unaffected.
 
 A local web dashboard lives in `host/` (FastAPI + WebSocket + vendored uPlot):

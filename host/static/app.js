@@ -12,7 +12,70 @@ const state = {
   curSamples: [],
   lastCalres: null,
   fe: null,             // latest front-end state
+  cvals: [],            // recent valid fused capacitances (for rolling average)
+  adcCal: {},           // per-range ADC R_eff / C0 (from boot + adccalres)
+  adcPoints: [],        // ADC calibration captures (τ vs C_ref)
 };
+
+// Parse a capacitance string with an optional unit suffix; plain numbers are pF.
+// Accepts e.g. "1000p", "10n", "1u", "4.7u", "100" (pF).
+function capToPf(str) {
+  const s = String(str || "").trim().toLowerCase();
+  const m = s.match(/^([0-9]*\.?[0-9]+)\s*(f|m|u|µ|n|p)?/);
+  if (!m) return NaN;
+  let v = parseFloat(m[1]);
+  if (!isFinite(v)) return NaN;
+  switch (m[2]) {
+    case "f": v *= 1e15; break;
+    case "m": v *= 1e9; break;
+    case "u": case "µ": v *= 1e6; break;
+    case "n": v *= 1e3; break;
+    default: break; // p or unit-less => pF
+  }
+  return v;
+}
+
+// Escape device-provided strings before inserting them into innerHTML.
+function esc(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+// ------------------------------------------------- capacitance rolling average
+const AVG_HISTORY_MAX = 200;
+function avgWindow() {
+  return parseInt(document.getElementById("avgWindow").value, 10) || 1;
+}
+function rollingAvg(n) {
+  if (!state.cvals.length) return null;
+  const slice = state.cvals.slice(-n);
+  return slice.reduce((a, b) => a + b, 0) / slice.length;
+}
+function updateCapReadout(ev) {
+  const w = avgWindow();
+  const avg = rollingAvg(w);
+  const instant = state.cvals.length ? state.cvals[state.cvals.length - 1] : null;
+  const shown = (w > 1 && avg != null) ? avg : instant;
+  document.getElementById("capValue").textContent = shown != null ? formatCap(shown) : "—";
+
+  let meta = "";
+  if (ev) meta = `ADC ${ev.n_adc ?? "—"} / OSC ${ev.n_osc ?? "—"} · raw ${ev.raw ?? "—"}`;
+  if (w > 1 && avg != null) {
+    const used = Math.min(w, state.cvals.length);
+    if (meta) meta += " · ";
+    meta += `avg${w} of ${used} · instant ${formatCap(instant)}`;
+  } else if (shown == null) {
+    meta = "waiting for telemetry…";
+  }
+  document.getElementById("capMeta").textContent = meta || "waiting for telemetry…";
+
+  // Compact history of the last few readings (newest last).
+  const recent = state.cvals.slice(-Math.max(w, 5));
+  document.getElementById("capHistory").textContent = recent.length
+    ? "history: " + recent.map((v) => formatCap(v)).join("  ")
+    : "";
+}
 
 // ---------------------------------------------------------------- toasts
 function toast(msg, cls = "", ttl = 4500) {
@@ -58,7 +121,7 @@ class TimeChart {
         { value: (u, v) => (v == null ? "" : new Date(v * 1000).toLocaleTimeString()) },
         ...series.map((s) => ({
           label: s.label, stroke: s.stroke, width: 1.6, spanGaps: true,
-          points: { show: false },
+          dash: s.dash, points: { show: false },
         })),
       ],
       axes: [{}, { size: 54 }],
@@ -68,9 +131,14 @@ class TimeChart {
     this.u = new uPlot(opts, [[], ...series.map(() => [])], this.el);
   }
   set(key, val) {
-    if (val == null || !isFinite(val)) return;
-    if (this.log && val <= 0) return;
-    this.last[key] = val;
+    // A non-finite value is a real "no reading this cycle" and must become a
+    // gap, not a re-plot of the previous value (that would show stale data as
+    // if it were the current measurement).
+    if (val == null || !isFinite(val) || (this.log && val <= 0)) {
+      this.last[key] = null;
+    } else {
+      this.last[key] = val;
+    }
     this.started = true;
   }
   tick(x) {
@@ -98,6 +166,7 @@ const charts = {
       { key: "fused", label: "fused", stroke: RANGE_COLORS[0] },
       { key: "adc", label: "ADC", stroke: RANGE_COLORS[1] },
       { key: "osc", label: "OSC", stroke: RANGE_COLORS[2] },
+      { key: "avg", label: "rolling avg", stroke: "#e6edf3", dash: [5, 4] },
     ],
   }),
   spread: new TimeChart("spreadChart", {
@@ -197,17 +266,99 @@ function renderCal() {
 }
 
 // ---------------------------------------------------------------- UI updates
+function resetCharts() {
+  for (const c of Object.values(charts)) {
+    c.xs = [];
+    c.data = c.seriesDef.map(() => []);
+    c.last = {};
+    c.started = false;
+    c.u.setData([[], ...c.seriesDef.map(() => [])]);
+  }
+  curveU.setData([[], [], []]);
+}
+// Clear every client-side series so a reconnect / device reboot cannot
+// double-count replayed history into the rolling average or the charts.
+function resetClientState() {
+  state.cvals = [];
+  state.curSamples = [];
+  state.lastCalres = null;
+  calPoints.length = 0;
+  state.adcPoints = [];
+  resetCharts();
+  renderCal();
+  renderAdcCal();
+  renderSampleTable();
+  updateCapReadout(null);
+}
 function onBoot(ev) {
+  // Device (re)boot: start clean so stale history from a prior session stays out.
+  resetClientState();
   state.ranges = ev.ranges || [];
   state.cal = state.ranges;
+  state.adcCal = {};
+  for (const r of state.ranges) {
+    if (r.adc_valid) state.adcCal[r.i] = { r_eff: r.adc_r_eff, c0_f: r.adc_c0_f, r_nom: r.r };
+  }
   renderCalTable();
+  renderAdcCalTable();
   const pills = document.getElementById("rangePills");
   pills.innerHTML = state.ranges.map((r) =>
-    `<span class="rangepill" id="rp${r.i}">${r.label}</span>`).join("");
+    `<span class="rangepill" id="rp${r.i}">${esc(r.label)}</span>`).join("");
+}
+
+// ------------------------------------------------- ADC calibration display
+function renderAdcCalTable() {
+  const el = document.getElementById("adcCalTable");
+  if (!el) return;
+  if (!state.ranges.length) { el.textContent = "waiting for device boot…"; return; }
+  const lines = state.ranges.map((r) => {
+    const c = state.adcCal[r.i];
+    if (!c) return `${String(r.label).padEnd(8)} R_eff=${r.r} Ω (nominal)   default`;
+    const series = (c.r_eff - (c.r_nom || r.r));
+    const sign = series >= 0 ? "+" : "-";
+    return `${String(r.label).padEnd(8)} R_eff=${c.r_eff.toFixed(2)} Ω (nom ${(c.r_nom || r.r)}, ${sign}${Math.abs(series).toFixed(2)} series)  C0=${(c.c0_f * 1e12).toFixed(1)} pF`;
+  });
+  el.textContent = lines.join("\n");
+}
+function onAdccalpt(ev) {
+  state.adcPoints.push({ x: ev.ref_pf, y: ev.tau_us, range: ev.range, op: ev.op });
+  renderAdcCal();
+}
+function onAdccalres(ev) {
+  if (ev.ok) {
+    state.adcCal[ev.range] = { r_eff: ev.r_eff, c0_f: ev.c0_f, r_nom: ev.r_nom };
+    renderAdcCalTable();
+    toast(`✓ ADC cal range ${RANGE_LABELS[ev.range] || ev.range}: R_eff ${ev.r_eff.toFixed(1)} Ω` +
+      (ev.r_nom ? ` (+${(ev.r_eff - ev.r_nom).toFixed(1)} series)` : ""), "ok");
+  } else {
+    toast("✗ ADC calibration failed", "warn");
+  }
+  renderAdcCal();
+}
+function renderAdcCal() {
+  const el = document.getElementById("adcCalChart");
+  if (!el) return;
+  const pts = state.adcPoints;
+  if (!pts.length) { el.innerHTML = ""; return; }
+  const W = el.clientWidth || 360, H = 180, pad = 40;
+  const xs = pts.map((p) => p.x), ys = pts.map((p) => p.y);
+  const xmin = Math.min(...xs), xmax = Math.max(...xs);
+  const ymin = Math.min(...ys), ymax = Math.max(...ys);
+  const sx = (x) => pad + (xmax === xmin ? 0.5 : (x - xmin) / (xmax - xmin)) * (W - pad - 10);
+  const sy = (y) => H - pad + 12 - (ymax === ymin ? 0.5 : (y - ymin) / (ymax - ymin)) * (H - pad - 12);
+  let svg = `<svg width="${W}" height="${H}">`;
+  svg += `<line x1="${pad}" y1="${H - pad + 12}" x2="${W - 10}" y2="${H - pad + 12}" stroke="#2b3442"/>`;
+  svg += `<line x1="${pad}" y1="8" x2="${pad}" y2="${H - pad + 12}" stroke="#2b3442"/>`;
+  for (const p of pts) {
+    svg += `<circle cx="${sx(p.x)}" cy="${sy(p.y)}" r="4" fill="${RANGE_COLORS[p.range] || "#fff"}"/>`;
+  }
+  svg += `<text x="${pad}" y="12" fill="#8b949e" font-size="10">τ (µs) vs C_ref (pF)</text>`;
+  svg += `</svg>`;
+  el.innerHTML = svg;
 }
 function renderCalTable() {
   const t = state.ranges.map((r) =>
-    `${r.label.padEnd(8)} K=${fmt(r.k, 5)}  T0=${fmt(r.t0_us, 2)} µs ${r.has_t0 ? '(tared)' : '(no tare)'}  ${r.valid ? 'calibrated' : 'default'}`).join("\n");
+    `${String(r.label || "").padEnd(8)} K=${fmt(r.k, 5)}  T0=${fmt(r.t0_us, 2)} µs ${r.has_t0 ? '(tared)' : '(no tare)'}  ${r.valid ? 'calibrated' : 'default'}`).join("\n");
   document.getElementById("calTable").textContent = t || "no calibration data yet";
 }
 function renderSampleTable() {
@@ -216,23 +367,29 @@ function renderSampleTable() {
     const t = s.method === "adc" ? fmt(s.tau_us, 1) + " µs" : fmt(s.tau_us, 1) + " µs";
     const second = s.method === "adc" ? "R² " + fmt(s.r2, 3) : fmt(s.freq, 1) + " Hz";
     const cls = s.plausible ? "ok" : (s.valid ? "bad" : "no");
-    return `<tr><td>${s.label}</td><td>${s.method}</td><td class="${cls}">${s.plausible ? 'ok' : (s.valid ? 'reject' : 'fail')}</td>` +
+    return `<tr><td>${esc(s.label || RANGE_LABELS[s.range])}</td><td>${esc(s.method)}</td><td class="${cls}">${s.plausible ? 'ok' : (s.valid ? 'reject' : 'fail')}</td>` +
       `<td>${formatCap(s.c)}</td><td>${fmt(s.q, 3)}</td><td>${t}</td><td>${second}</td></tr>`;
   }).join("") || `<tr><td colspan="7" class="dim">waiting for a cycle…</td></tr>`;
 }
 function onCycle(ev) {
-  document.getElementById("capValue").textContent = ev.valid ? formatCap(ev.c) : "—";
-  document.getElementById("capMeta").textContent =
-    `${RANGE_LABELS.length} ranges · ADC ${ev.n_adc} / OSC ${ev.n_osc} · raw ${ev.raw}`;
+  if (ev.valid && ev.c > 0) {
+    state.cvals.push(ev.c);
+    if (state.cvals.length > AVG_HISTORY_MAX) state.cvals.shift();
+  }
+  updateCapReadout(ev);
   document.getElementById("conf").textContent = ev.valid ? confFromSpread(ev.spread) : "—";
-  document.getElementById("spread").textContent = (ev.spread * 100).toFixed(1) + " %";
+  document.getElementById("spread").textContent =
+    (ev.spread != null && isFinite(ev.spread)) ? (ev.spread * 100).toFixed(1) + " %" : "—";
   document.getElementById("adcEst").textContent = formatCap(ev.adc);
   document.getElementById("oscEst").textContent = formatCap(ev.osc);
-  document.getElementById("nsamp").textContent = `${ev.n_adc} / ${ev.n_osc}`;
+  document.getElementById("nsamp").textContent =
+    `${ev.n_adc ?? "—"} / ${ev.n_osc ?? "—"}`;
   document.getElementById("mismatch").classList.toggle("hidden", !ev.mismatch);
   charts.cap.set("fused", ev.valid ? ev.c * 1e12 : null);
   charts.cap.set("adc", ev.adc != null ? ev.adc * 1e12 : null);
   charts.cap.set("osc", ev.osc != null ? ev.osc * 1e12 : null);
+  const avg = rollingAvg(avgWindow());
+  charts.cap.set("avg", avg != null ? avg * 1e12 : null);
   charts.spread.set("spread", ev.spread * 100);
   renderSampleTable();
   state.curSamples = [];
@@ -287,6 +444,28 @@ function updateFe(ev) {
   } else {
     warn.classList.add("hidden");
   }
+
+  const bp = document.getElementById("btnAutoPre");
+  if (bp) {
+    bp.textContent = "Auto pre-charge: " + (ev.auto_pre ? "ON" : "OFF");
+    bp.classList.toggle("on", !!ev.auto_pre);
+  }
+  const bd = document.getElementById("btnAutoDis");
+  if (bd) {
+    bd.textContent = "Auto discharge: " + (ev.auto_dis ? "ON" : "OFF");
+    bd.classList.toggle("on", !!ev.auto_dis);
+  }
+}
+// No telemetry: the front-end state is unknown, not "safe".  Never let a stale
+// "IDLE" badge imply the DUT is discharged after a link drop.
+function markFeStale() {
+  const badge = document.getElementById("feState");
+  badge.textContent = "UNKNOWN";
+  badge.className = "fe-badge idle";
+  document.getElementById("feDetail").textContent = "no telemetry — front-end state unknown";
+  const warn = document.getElementById("feWarn");
+  warn.classList.remove("hidden");
+  warn.textContent = "⚠ Telemetry lost — front-end state unknown. Do not assume the DUT is discharged.";
 }
 function onAck(ev) {
   if (ev.ok) toast("✓ " + ev.cmd + " — " + ev.msg, "ok");
@@ -302,6 +481,8 @@ function onEvent(ev) {
     case "tare": onTare(ev); break;
     case "calpt": onCalpt(ev); break;
     case "calres": onCalres(ev); break;
+    case "adccalpt": onAdccalpt(ev); break;
+    case "adccalres": onAdccalres(ev); break;
     case "fe": updateFe(ev); break;
     case "ack": onAck(ev); break;
   }
@@ -319,11 +500,13 @@ function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   ws = new WebSocket(`${proto}://${location.host}/ws`);
   ws.onopen = () => setLink(false, null, null);
-  ws.onclose = () => { setLink(false, null, true); setTimeout(connect, 1500); };
+  ws.onclose = () => { setLink(false, null, true); markFeStale(); setTimeout(connect, 1500); };
   ws.onerror = () => {};
   ws.onmessage = (m) => {
-    const msg = JSON.parse(m.data);
+    let msg;
+    try { msg = JSON.parse(m.data); } catch { return; }
     if (msg.type === "status") setLink(msg.connected, msg.port, msg.error);
+    else if (msg.type === "reset") resetClientState();
     else if (msg.type === "event") onEvent(msg.event);
     else if (msg.type === "log") appendLog(msg.line);
   };
@@ -373,12 +556,21 @@ document.getElementById("btnIdle").onclick = () => {
               "Prefer Discharge for safety."))
     cmd("idle");
 };
+document.getElementById("btnAutoPre").onclick = () => {
+  const on = !(state.fe && state.fe.auto_pre);
+  cmd("autoprecharge " + (on ? "on" : "off"));
+};
+document.getElementById("btnAutoDis").onclick = () => {
+  const on = !(state.fe && state.fe.auto_dis);
+  cmd("autodischarge " + (on ? "on" : "off"));
+};
 document.getElementById("mode").onchange = (e) => {
   const v = e.target.value;
   cmd(v === "-1" ? "auto" : "range " + v);
 };
 document.getElementById("curveChk").onchange = (e) =>
   send({ type: "curve", on: e.target.checked });
+document.getElementById("avgWindow").onchange = () => updateCapReadout(null);
 document.getElementById("btnTare").onclick = () => calCmd("zero");
 document.getElementById("btnTareAll").onclick = () => cmd("zeroall");
 document.getElementById("btnCalTable").onclick = () => cmd("cal?");
@@ -395,6 +587,25 @@ document.getElementById("btnCalB").onclick = () => {
   const v = document.getElementById("refB").value;
   if (v) calCmd("cal2 " + v);
 };
+
+// ADC (RC-step) series-resistance calibration
+document.getElementById("btnAdcCal1p").onclick = () => {
+  const pf = capToPf(document.getElementById("adcRef1").value);
+  if (isFinite(pf) && pf > 0) calCmd("adccal " + pf);
+  else toast("Enter a reference capacitance (e.g. 10u, 1u, 1000000)", "warn");
+};
+document.getElementById("btnAdcCalA").onclick = () => {
+  const pf = capToPf(document.getElementById("adcRefA").value);
+  if (isFinite(pf) && pf > 0) calCmd("adccal1 " + pf);
+  else toast("Enter reference 1 capacitance (e.g. 1u)", "warn");
+};
+document.getElementById("btnAdcCalB").onclick = () => {
+  const pf = capToPf(document.getElementById("adcRefB").value);
+  if (isFinite(pf) && pf > 0) calCmd("adccal2 " + pf);
+  else toast("Enter reference 2 capacitance (e.g. 10u)", "warn");
+};
+document.getElementById("btnAdcCalTable").onclick = () => cmd("adccal?");
+document.getElementById("btnAdcCalClear").onclick = () => calCmd("adccalclear");
 document.getElementById("btnSend").onclick = () => {
   const el = document.getElementById("cmdInput");
   if (el.value.trim()) { cmd(el.value.trim()); el.value = ""; }
@@ -424,3 +635,5 @@ setInterval(() => {
 
 connect();
 renderSampleTable();
+updateCapReadout(null);
+renderAdcCalTable();
