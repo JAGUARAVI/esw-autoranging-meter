@@ -36,6 +36,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_task_wdt.h"
 #include "freertos/FreeRTOS.h"
@@ -181,6 +182,22 @@ typedef struct {
     bool suspicious;    // timing/health looks wrong (down-weighted, still usable)
 } sample_t;
 
+// One entry of the fusion breakdown, for the dashboard's fusion strip.  Kept
+// in file-scope statics (single measurement task) so fusion_t stays small and
+// can still be returned by value without bloating the call stack.
+typedef struct {
+    uint8_t range_idx;
+    uint8_t method;          // method_t
+    double  c_f;             // reconstructed DUT capacitance (F)
+    double  c_eq_f;          // series-equivalent the circuit saw (F)
+    double  q;               // physics quality 0..1
+    double  w;               // weight actually used in the weighted average
+    double  r2;              // ADC only: exponential-fit R² (0 for OSC)
+    bool    kept;            // passed the fusion median gate
+} fusion_contrib_t;
+
+#define FUSION_CONTRIB_MAX MAX_SAMPLES
+
 typedef struct {
     bool valid;
     double capacitance_f;
@@ -192,7 +209,37 @@ typedef struct {
     double osc_estimate;    // fused OSC-only value (NAN if none)
     bool method_mismatch;   // ADC and OSC disagree beyond uncertainty
     int raw_samples;        // total valid samples collected
+    // --- fusion-breakdown telemetry (for the dashboard) ---
+    double median_f;        // median of the pre-gate population (F), 0 if none
+    int n_kept;             // valid+plausible samples entering the gate
+    int n_gated;            // of those, rejected by the median gate
+    double c_min_f;         // min / max of the KEPT population (F)
+    double c_max_f;
 } fusion_t;
+
+// Fusion breakdown, filled by fuse_samples() and read by evt_fuse().
+static fusion_contrib_t g_fusion_contrib[FUSION_CONTRIB_MAX];
+static int g_fusion_n_contrib = 0;
+
+// Per-cycle autoranging decision snapshot, filled by the orchestrator and read
+// by evt_sweep() so the dashboard can show WHY each range/method was used.
+typedef struct {
+    bool   valid;                 // a sweep event is meaningful for this cycle
+    bool   locked;                // locked-range mode instead of autoranging
+    int    lock_range;            // range index when locked (-1 otherwise)
+    bool   have_rough;            // probe produced a usable rough estimate
+    double rough_f;               // rough capacitance from the probe (F)
+    bool   sub_nf;                // rough C below the ADC sub-nF gate
+    bool   saturated;             // fastest range saturated -> 100 kΩ sub used
+    bool   adc_sub;               // the 100 kΩ saturation sub-measurement ran
+    int    osc_best_range;        // nominated oscillator range (-1 = none)
+    bool   adc_tried[RANGE_COUNT];
+} sweep_info_t;
+static sweep_info_t g_sweep;
+
+// System-health counters for evt_stat().
+static uint32_t g_cycle_count = 0;
+static uint32_t g_last_cycle_ms = 0;
 
 // ---------------------------------------------------------------------------
 // Range table — note: on the schematic the 1 MΩ channel shares the mux with
@@ -899,6 +946,60 @@ static void evt_sample(const sample_t *s)
            s->valid ? "true" : "false", s->plausible ? "true" : "false",
            s->capacitance_f, s->c_eq_f, s->quality, s->tau_us, s->freq_hz,
            s->fit_r2, vinf);
+}
+
+// Fusion breakdown: exactly which (range, method) samples entered the fusion,
+// their weight, and whether the median gate kept them.  Reads the file-scope
+// contrib array filled by fuse_samples().  Emitted once per cycle, right after
+// the cycle event.
+static void evt_fuse(const fusion_t *f)
+{
+    if (!g_stream) return;
+    printf("@@EVT {\"t\":\"fuse\",\"valid\":%s,\"median\":%.9g,\"c\":%.9g,"
+           "\"c_min\":%.9g,\"c_max\":%.9g,\"spread\":%.6g,\"gate_rel\":%.4g,"
+           "\"n_kept\":%d,\"n_gated\":%d,\"w_total\":%.6g,\"contrib\":[",
+           f->valid ? "true" : "false", f->median_f, f->capacitance_f,
+           f->c_min_f, f->c_max_f, f->rel_spread, (double)FUSION_GATE_REL,
+           f->n_kept, f->n_gated, f->total_weight);
+    for (int i = 0; i < g_fusion_n_contrib; ++i) {
+        const fusion_contrib_t *c = &g_fusion_contrib[i];
+        printf("%s{\"r\":%d,\"label\":\"%s\",\"m\":\"%s\",\"c\":%.9g,\"c_eq\":%.9g,"
+               "\"q\":%.6g,\"w\":%.6g,\"r2\":%.6g,\"kept\":%s}",
+               i ? "," : "", c->range_idx, RANGES[c->range_idx].label,
+               c->method == (uint8_t)METHOD_ADC_STEP ? "adc" : "osc",
+               c->c_f, c->c_eq_f, c->q, c->w, c->r2, c->kept ? "true" : "false");
+    }
+    printf("]}\n");
+}
+
+// Autoranging decision snapshot: the rough probe value, the sub-nF handoff,
+// which ADC ranges were swept, and which oscillator range was nominated.
+static void evt_sweep(void)
+{
+    if (!g_stream || !g_sweep.valid) return;
+    printf("@@EVT {\"t\":\"sweep\",\"mode\":\"%s\",\"have_rough\":%s,\"rough\":%.9g,"
+           "\"sub_nf\":%s,\"saturated\":%s,\"adc_sub\":%s,\"osc_best\":%d,"
+           "\"lock\":%d,\"adc_tried\":[",
+           g_sweep.locked ? "locked" : "auto",
+           g_sweep.have_rough ? "true" : "false", g_sweep.rough_f,
+           g_sweep.sub_nf ? "true" : "false",
+           g_sweep.saturated ? "true" : "false",
+           g_sweep.adc_sub ? "true" : "false",
+           g_sweep.osc_best_range, g_sweep.locked ? g_sweep.lock_range : -1);
+    for (int r = 0; r < RANGE_COUNT; ++r)
+        printf("%s%s", r ? "," : "", g_sweep.adc_tried[r] ? "true" : "false");
+    printf("]}\n");
+}
+
+// Device health: uptime, completed cycles, last cycle duration, free heap.
+static void evt_stat(void)
+{
+    if (!g_stream) return;
+    printf("@@EVT {\"t\":\"stat\",\"uptime_ms\":%lld,\"cycles\":%u,\"cycle_ms\":%u,"
+           "\"heap_free\":%u,\"heap_min\":%u}\n",
+           (long long)(esp_timer_get_time() / 1000), (unsigned)g_cycle_count,
+           (unsigned)g_last_cycle_ms, (unsigned)esp_get_free_heap_size(),
+           (unsigned)esp_get_minimum_free_heap_size());
 }
 
 static void evt_curve(uint8_t range_idx, int vinf, double tau_us, double r2,
@@ -1669,6 +1770,8 @@ static fusion_t fuse_samples(const sample_t *samples, int n)
         .total_weight = 0.0, .n_adc = 0, .n_osc = 0,
         .adc_estimate = NAN, .osc_estimate = NAN, .method_mismatch = false,
         .raw_samples = n,
+        .median_f = 0.0, .n_kept = 0, .n_gated = 0,
+        .c_min_f = 0.0, .c_max_f = 0.0,
     };
 
     static double cvals[MAX_SAMPLES];   // static: keep off the main stack
@@ -1682,8 +1785,21 @@ static fusion_t fuse_samples(const sample_t *samples, int n)
         cvals[n_kept] = samples[i].capacitance_f;
         weights[n_kept] = samples[i].quality;
         kept_method[n_kept] = (int)samples[i].method;
+        // Mirror the population into the breakdown telemetry (provisional
+        // "kept" until the median gate below confirms it).
+        fusion_contrib_t *gc = &g_fusion_contrib[n_kept];
+        gc->range_idx = samples[i].range_idx;
+        gc->method    = (uint8_t)samples[i].method;
+        gc->c_f       = samples[i].capacitance_f;
+        gc->c_eq_f    = samples[i].c_eq_f;
+        gc->q         = samples[i].quality;
+        gc->w         = samples[i].quality;
+        gc->r2        = (samples[i].method == METHOD_ADC_STEP) ? samples[i].fit_r2 : 0.0;
+        gc->kept      = false;
         n_kept++;
     }
+    g_fusion_n_contrib = n_kept;
+    f.n_kept = n_kept;
     if (n_kept == 0) return f;
 
     // Per-method estimates are computed on the RAW (pre-gate) populations so a
@@ -1709,15 +1825,26 @@ static fusion_t fuse_samples(const sample_t *samples, int n)
     }
 
     double med = median_of(cvals, n_kept);
+    f.median_f = med;
 
     // Median gate: discard anything more than FUSION_GATE_REL (relative) away
     // from the median — kills one-off ADC glitches / ISR hiccups.
     double lw_sum = 0.0, lw = 0.0;
     int n_adc_kept = 0, n_osc_kept = 0;
+    double cmin = 0.0, cmax = 0.0;
+    bool have_kept = false;
 
     for (int i = 0; i < n_kept; ++i) {
         if (med > 0.0 && fabs(cvals[i] - med) / med > FUSION_GATE_REL) {
+            g_fusion_contrib[i].kept = false;
+            f.n_gated++;
             continue;
+        }
+        g_fusion_contrib[i].kept = true;
+        if (!have_kept) { cmin = cmax = cvals[i]; have_kept = true; }
+        else {
+            if (cvals[i] < cmin) cmin = cvals[i];
+            if (cvals[i] > cmax) cmax = cvals[i];
         }
         double logc = log(cvals[i] > 0.0 ? cvals[i] : 1e-15);
         double w = weights[i];
@@ -1727,6 +1854,8 @@ static fusion_t fuse_samples(const sample_t *samples, int n)
     }
     f.n_adc = n_adc_kept;
     f.n_osc = n_osc_kept;
+    f.c_min_f = have_kept ? cmin : 0.0;
+    f.c_max_f = have_kept ? cmax : 0.0;
     if (lw <= 0.0) return f;
 
     double fused_log = lw_sum / lw;
@@ -1754,6 +1883,12 @@ static fusion_t measure_capacitance_autoranged(void)
 
     static sample_t samples[MAX_SAMPLES];   // static: keep off the main stack
     int n = 0;
+
+    memset(&g_sweep, 0, sizeof(g_sweep));
+    g_sweep.valid = true;
+    g_sweep.locked = false;
+    g_sweep.lock_range = -1;
+    g_sweep.osc_best_range = -1;
 
     // ---- Phase 1: probe with the oscillator for a rough estimate ----
     g_phase = "probe";
@@ -1826,6 +1961,13 @@ static fusion_t measure_capacitance_autoranged(void)
         osc_best_range = 2;
     }
 
+    // Snapshot the decision for the dashboard's range-decision matrix.
+    g_sweep.have_rough = have_rough;
+    g_sweep.rough_f = rough_c;
+    g_sweep.sub_nf = sub_nf;
+    g_sweep.osc_best_range = osc_best_range;
+    for (int r = 0; r < RANGE_COUNT; ++r) g_sweep.adc_tried[r] = adc_tried[r];
+
     // ---- Phase 3: gather samples across ranges and methods ----
     bool fastest_range_saturated = false;
     double best_adc_q = -1.0;
@@ -1848,6 +1990,7 @@ static fusion_t measure_capacitance_autoranged(void)
     // sub-range, which slows the edge ~1000x into the accurate ADC window.
     if (fastest_range_saturated && !adc_tried[2] && n < MAX_SAMPLES) {
         g_phase = "adc-sub";
+        g_sweep.adc_sub = true;
         sample_t s = measure_adc_range(2);
         if (s.valid) samples[n++] = s;
         if (s.valid && s.plausible) preferred_range = 2;
@@ -1904,6 +2047,8 @@ static fusion_t measure_capacitance_autoranged(void)
     }
 
     g_phase = "fuse";
+    g_sweep.saturated = fastest_range_saturated;
+    evt_sweep();
     fusion_t result = fuse_samples(samples, n);
     return result;
 }
@@ -1919,6 +2064,14 @@ static fusion_t measure_locked_range(uint8_t range_idx)
     static sample_t samples[MAX_SAMPLES];
     int n = 0;
 
+    memset(&g_sweep, 0, sizeof(g_sweep));
+    g_sweep.valid = true;
+    g_sweep.locked = true;
+    g_sweep.lock_range = (int)range_idx;
+    g_sweep.have_rough = false;
+    g_sweep.osc_best_range = (int)range_idx;
+    g_sweep.adc_tried[range_idx] = true;
+
     g_phase = "lock-osc";
     sample_t o = measure_osc_range(range_idx);
     if (o.valid) samples[n++] = o;
@@ -1928,6 +2081,7 @@ static fusion_t measure_locked_range(uint8_t range_idx)
     if (a.valid) samples[n++] = a;
 
     g_phase = "fuse";
+    evt_sweep();
     return fuse_samples(samples, n);
 }
 
@@ -2945,10 +3099,13 @@ void app_main(void)
 
         g_phase = "auto";
         g_measuring = true;
+        int64_t t_cycle = esp_timer_get_time();
         fusion_t result = (g_range_lock >= 0)
                               ? measure_locked_range((uint8_t)g_range_lock)
                               : measure_capacitance_autoranged();
         g_measuring = false;
+        g_last_cycle_ms = (uint32_t)((esp_timer_get_time() - t_cycle) / 1000);
+        g_cycle_count++;
 
         if (g_abort_cycle) {   // an exclusive command cut this cycle short
             g_abort_cycle = false;
@@ -2957,6 +3114,8 @@ void app_main(void)
 
         log_result(&result);
         evt_cycle(&result);
+        evt_fuse(&result);
+        evt_stat();
 
         if (g_single_shot) { g_single_shot = false; g_run = false;
                              front_end_finish(); }

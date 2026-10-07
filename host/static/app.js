@@ -3,18 +3,48 @@
  * stays empty until its first real point arrives. */
 "use strict";
 
-const RANGE_COLORS = ["#f87171", "#fbbf24", "#60a5fa", "#4ade80"];
+// --------------------------------------------------------------- theming
+// Chart colours follow the active theme; series strokes are functions of the
+// theme object so a theme switch can rebuild the plots with the right palette.
+const THEMES = {
+  dark: {
+    axis: "#8b949e", grid: "rgba(255,255,255,0.08)",
+    font: '12px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+    adc: "#60a5fa", osc: "#34d399", accent: "#4ade80", accent2: "#60a5fa",
+    dim: "#8b949e", err: "#f87171",
+    range: ["#f87171", "#fbbf24", "#60a5fa", "#4ade80"],
+  },
+  light: {
+    axis: "#64748b", grid: "rgba(15,23,42,0.10)",
+    font: '12px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+    adc: "#1f3a5f", osc: "#0e8a78", accent: "#0e8a78", accent2: "#1f3a5f",
+    dim: "#64748b", err: "#dc2626",
+    range: ["#dc2626", "#b45309", "#2563eb", "#16a34a"],
+  },
+};
+let THEME = THEMES.dark;
+const resolveColor = (c) => (typeof c === "function" ? c(THEME) : c);
+
 const RANGE_LABELS = ["100 Ω", "1 kΩ", "100 kΩ", "1 MΩ"];
 
 const state = {
   ranges: [],           // from boot
   cal: [],
-  curSamples: [],
+  curSamples: [],       // samples for the cycle currently being rendered
   lastCalres: null,
   fe: null,             // latest front-end state
   cvals: [],            // recent valid fused capacitances (for rolling average)
   adcCal: {},           // per-range ADC R_eff / C0 (from boot + adccalres)
   adcPoints: [],        // ADC calibration captures (τ vs C_ref)
+  sweep: null,          // latest sweep (autoranging decision)
+  fusion: null,         // latest fuse (fusion breakdown)
+  stat: null,           // latest device statistic
+  urls: [],             // LAN URLs advertised by the host
+  dutRefF: null,        // nominal DUT capacitance (F) for the accuracy panel
+  errSeries: [],        // recent signed error fractions
+  lastCurve: null,      // last ADC charge curve (for theme re-render)
+  lastSpread: null,     // last spread (for theme re-render)
+  lastValid: false,     // last validity (for theme re-render)
 };
 
 // Parse a capacitance string with an optional unit suffix; plain numbers are pF.
@@ -70,7 +100,6 @@ function updateCapReadout(ev) {
   }
   document.getElementById("capMeta").textContent = meta || "waiting for telemetry…";
 
-  // Compact history of the last few readings (newest last).
   const recent = state.cvals.slice(-Math.max(w, 5));
   document.getElementById("capHistory").textContent = recent.length
     ? "history: " + recent.map((v) => formatCap(v)).join("  ")
@@ -95,40 +124,54 @@ function formatCap(f) {
   return (f * 1e6).toFixed(3) + " µF";
 }
 function confFromSpread(s) {
-  if (s == null || !isFinite(s)) return "—";
-  if (s < 0.05) return "HIGH";
-  if (s < 0.15) return "MED";
-  return "LOW";
+  if (s == null || !isFinite(s)) return { label: "—", frac: 0, color: THEME.dim };
+  if (s < 0.05) return { label: "HIGH", frac: 1 - s / 0.05 * 0.15, color: THEME.accent };
+  if (s < 0.15) return { label: "MED", frac: 0.6, color: "#f59e0b" };
+  return { label: "LOW", frac: 0.28, color: THEME.err };
 }
 const fmt = (v, d = 2) => (v == null || !isFinite(v) ? "—" : Number(v).toFixed(d));
 
 // ---------------------------------------------------------------- time charts
 class TimeChart {
-  constructor(elId, { log = false, series, height = 200 }) {
+  constructor(elId, cfg) {
     this.el = document.getElementById(elId);
-    this.seriesDef = series;
-    this.log = log;
+    this.seriesDef = cfg.series;
+    this.log = !!cfg.log;
+    this.height = cfg.height || 220;
+    this.yLabel = cfg.yLabel || "";
     this.last = {};
     this.started = false;
     this.xs = [];
-    this.data = series.map(() => []);
-    const yscale = log ? { distr: 3, log: 10 } : { distr: 1 };
+    this.data = cfg.series.map(() => []);
+    this.mount();
+  }
+  mount() {
+    const T = THEME;
+    const yscale = this.log ? { distr: 3, log: 10 } : { distr: 1 };
     const opts = {
       width: this.el.clientWidth || 400,
-      height,
+      height: this.height,
       scales: { x: { time: true }, y: yscale },
       series: [
         { value: (u, v) => (v == null ? "" : new Date(v * 1000).toLocaleTimeString()) },
-        ...series.map((s) => ({
-          label: s.label, stroke: s.stroke, width: 1.6, spanGaps: true,
+        ...this.seriesDef.map((s) => ({
+          label: s.label, stroke: resolveColor(s.stroke), width: 1.6, spanGaps: true,
           dash: s.dash, points: { show: false },
         })),
       ],
-      axes: [{}, { size: 54 }],
+      axes: [
+        { stroke: T.axis, grid: { stroke: T.grid }, ticks: { stroke: T.grid } },
+        { size: 54, stroke: T.axis, grid: { stroke: T.grid }, ticks: { stroke: T.grid },
+          label: this.yLabel, labelSize: 11, labelFont: T.font },
+      ],
       legend: { show: true, live: true },
       cursor: { drag: { x: true, y: false } },
     };
-    this.u = new uPlot(opts, [[], ...series.map(() => [])], this.el);
+    this.u = new uPlot(opts, [this.xs, ...this.data], this.el);
+  }
+  rebuild() {
+    if (this.u) this.u.destroy();
+    this.mount();
   }
   set(key, val) {
     // A non-finite value is a real "no reading this cycle" and must become a
@@ -156,56 +199,71 @@ class TimeChart {
     }
     this.u.setData([this.xs, ...this.data]);
   }
-  resize() { this.u.setSize({ width: this.el.clientWidth || 400, height: this.el.clientHeight || 200 }); }
+  resize() { this.u.setSize({ width: this.el.clientWidth || 400, height: this.height }); }
 }
 
 const charts = {
   cap: new TimeChart("capChart", {
-    log: true,
+    log: true, yLabel: "pF",
     series: [
-      { key: "fused", label: "fused", stroke: RANGE_COLORS[0] },
-      { key: "adc", label: "ADC", stroke: RANGE_COLORS[1] },
-      { key: "osc", label: "OSC", stroke: RANGE_COLORS[2] },
-      { key: "avg", label: "rolling avg", stroke: "#e6edf3", dash: [5, 4] },
+      { key: "fused", label: "fused", stroke: (T) => T.accent },
+      { key: "adc", label: "ADC", stroke: (T) => T.adc },
+      { key: "osc", label: "OSC", stroke: (T) => T.osc },
+      { key: "avg", label: "rolling avg", stroke: (T) => T.dim, dash: [5, 4] },
     ],
   }),
   spread: new TimeChart("spreadChart", {
-    series: [{ key: "spread", label: "spread %", stroke: RANGE_COLORS[3] }],
+    yLabel: "%",
+    series: [{ key: "spread", label: "spread %", stroke: (T) => T.range[3] }],
   }),
   freq: new TimeChart("freqChart", {
-    log: true,
-    series: RANGE_LABELS.map((l, i) => ({ key: "r" + i, label: l, stroke: RANGE_COLORS[i] })),
+    log: true, yLabel: "Hz",
+    series: RANGE_LABELS.map((l, i) => ({ key: "r" + i, label: l, stroke: (T) => T.range[i] })),
   }),
   tau: new TimeChart("tauChart", {
-    log: true,
-    series: RANGE_LABELS.map((l, i) => ({ key: "r" + i, label: l, stroke: RANGE_COLORS[i] })),
+    log: true, yLabel: "µs",
+    series: RANGE_LABELS.map((l, i) => ({ key: "r" + i, label: l, stroke: (T) => T.range[i] })),
   }),
   tare: new TimeChart("tareChart", {
-    series: RANGE_LABELS.map((l, i) => ({ key: "r" + i, label: l, stroke: RANGE_COLORS[i] })),
+    yLabel: "µs",
+    series: RANGE_LABELS.map((l, i) => ({ key: "r" + i, label: l, stroke: (T) => T.range[i] })),
+  }),
+  err: new TimeChart("errChart", {
+    height: 180, yLabel: "%",
+    series: [{ key: "err", label: "error %", stroke: (T) => T.accent2 }],
   }),
 };
 
 // ---------------------------------------------------------------- curve chart
-const curveU = new uPlot(
-  {
-    width: document.getElementById("curveChart").clientWidth || 400,
-    height: 200,
-    scales: { x: { time: false }, y: {} },
-    series: [
-      { value: (u, v) => (v == null ? "" : v.toFixed(1) + " µs") },
-      { label: "V_cap (mV)", stroke: RANGE_COLORS[2], width: 1.8 },
-      { label: "fitted exp", stroke: RANGE_COLORS[0], width: 1.6, dash: [5, 4] },
-    ],
-    axes: [{ label: "t (µs)" }, { label: "mV" }],
-    legend: { show: true, live: true },
-  },
-  [[], [], []],
-  document.getElementById("curveChart")
-);
+let curveU = null;
+function mountCurve() {
+  const T = THEME;
+  curveU = new uPlot(
+    {
+      width: document.getElementById("curveChart").clientWidth || 400,
+      height: 220,
+      scales: { x: { time: false }, y: {} },
+      series: [
+        { value: (u, v) => (v == null ? "" : v.toFixed(1) + " µs") },
+        { label: "V_cap (mV)", stroke: T.range[2], width: 1.8 },
+        { label: "fitted exp", stroke: T.range[0], width: 1.6, dash: [5, 4] },
+      ],
+      axes: [
+        { stroke: T.axis, grid: { stroke: T.grid }, ticks: { stroke: T.grid }, label: "t (µs)", labelSize: 11, labelFont: T.font },
+        { stroke: T.axis, grid: { stroke: T.grid }, ticks: { stroke: T.grid }, label: "mV", labelSize: 11, labelFont: T.font },
+      ],
+      legend: { show: true, live: true },
+    },
+    [[], [], []],
+    document.getElementById("curveChart")
+  );
+}
+mountCurve();
 
 function onCurve(ev) {
   const pts = ev.pts || [];
   if (!pts.length) return;
+  state.lastCurve = ev;
   const xs = pts.map((p) => p[0]);
   const ys = pts.map((p) => p[1]);
   let fit = [];
@@ -234,26 +292,39 @@ function onCalres(ev) {
 }
 function renderCal() {
   const el = document.getElementById("calChart");
-  const W = el.clientWidth || 400, H = 200, pad = 34;
+  const W = el.clientWidth || 400, H = 220, pad = 40, padR = 14, padT = 14, padB = 30;
   if (!calPoints.length) { el.innerHTML = ""; return; }
+  const T = THEME;
   const xs = calPoints.map((p) => p.x), ys = calPoints.map((p) => p.y);
   const xmin = Math.min(...xs), xmax = Math.max(...xs);
   const ymin = Math.min(...ys), ymax = Math.max(...ys);
-  const sx = (x) => pad + (xmax === xmin ? 0.5 : (x - xmin) / (xmax - xmin)) * (W - pad - 10);
-  const sy = (y) => H - pad + 14 - (ymax === ymin ? 0.5 : (y - ymin) / (ymax - ymin)) * (H - pad - 14);
+  const sx = (x) => pad + (xmax === xmin ? 0.5 : (x - xmin) / (xmax - xmin)) * (W - pad - padR);
+  const sy = (y) => (H - padB) - (ymax === ymin ? 0.5 : (y - ymin) / (ymax - ymin)) * (H - padB - padT);
   let svg = `<svg width="${W}" height="${H}">`;
-  svg += `<line x1="${pad}" y1="${H - pad + 14}" x2="${W - 10}" y2="${H - pad + 14}" stroke="#2b3442"/>`;
-  svg += `<line x1="${pad}" y1="10" x2="${pad}" y2="${H - pad + 14}" stroke="#2b3442"/>`;
+  // grid + axes
+  for (let i = 0; i <= 4; i++) {
+    const gy = padT + (i / 4) * (H - padB - padT);
+    const gx = pad + (i / 4) * (W - pad - padR);
+    svg += `<line x1="${pad}" y1="${gy}" x2="${W - padR}" y2="${gy}" stroke="${T.grid}"/>`;
+    svg += `<line x1="${gx}" y1="${padT}" x2="${gx}" y2="${H - padB}" stroke="${T.grid}"/>`;
+  }
+  svg += `<line x1="${pad}" y1="${H - padB}" x2="${W - padR}" y2="${H - padB}" stroke="${T.axis}"/>`;
+  svg += `<line x1="${pad}" y1="${padT}" x2="${pad}" y2="${H - padB}" stroke="${T.axis}"/>`;
+  svg += `<text x="${pad - 4}" y="${padT + 6}" fill="${T.dim}" font-size="10" text-anchor="end">${ymax.toFixed(0)}</text>`;
+  svg += `<text x="${pad - 4}" y="${H - padB}" fill="${T.dim}" font-size="10" text-anchor="end">${ymin.toFixed(0)}</text>`;
+  svg += `<text x="${pad}" y="${H - 8}" fill="${T.dim}" font-size="10">${xmin.toFixed(0)}</text>`;
+  svg += `<text x="${W - padR}" y="${H - 8}" fill="${T.dim}" font-size="10" text-anchor="end">${xmax.toFixed(0)}</text>`;
+  svg += `<text x="${pad}" y="11" fill="${T.dim}" font-size="10">T (µs)</text>`;
+  svg += `<text x="${W - padR}" y="11" fill="${T.dim}" font-size="10" text-anchor="end">C_ref (pF)</text>`;
   // fitted model line T = K·R·C + T0 (C in pF -> F, T in us)
   const cr = state.lastCalres, rng = state.ranges[cr ? cr.range : calPoints[calPoints.length - 1].range];
   if (cr && cr.ok && cr.k > 0 && rng) {
-    const T = (cpf) => cr.k * rng.r * (cpf * 1e-12) * 1e6 + cr.t0_us;
-    svg += `<line x1="${sx(xmin)}" y1="${sy(T(xmin))}" x2="${sx(xmax)}" y2="${sy(T(xmax))}" stroke="#f87171" stroke-dasharray="5 4" stroke-width="1.5"/>`;
+    const Tf = (cpf) => cr.k * rng.r * (cpf * 1e-12) * 1e6 + cr.t0_us;
+    svg += `<line x1="${sx(xmin)}" y1="${sy(Tf(xmin))}" x2="${sx(xmax)}" y2="${sy(Tf(xmax))}" stroke="${T.err}" stroke-dasharray="5 4" stroke-width="1.5"/>`;
   }
   for (const p of calPoints) {
-    svg += `<circle cx="${sx(p.x)}" cy="${sy(p.y)}" r="4" fill="${RANGE_COLORS[p.range] || '#fff'}"/>`;
+    svg += `<circle cx="${sx(p.x)}" cy="${sy(p.y)}" r="4" fill="${THEME.range[p.range] || '#fff'}"/>`;
   }
-  svg += `<text x="${pad}" y="12" fill="#8b949e" font-size="10">T (µs) vs C_ref (pF)</text>`;
   svg += `</svg>`;
   el.innerHTML = svg;
   const meta = document.getElementById("calMeta");
@@ -265,29 +336,177 @@ function renderCal() {
   }
 }
 
-// ---------------------------------------------------------------- UI updates
-function resetCharts() {
-  for (const c of Object.values(charts)) {
-    c.xs = [];
-    c.data = c.seriesDef.map(() => []);
-    c.last = {};
-    c.started = false;
-    c.u.setData([[], ...c.seriesDef.map(() => [])]);
+// ============================================================ fusion panel
+function phaseStep(p) {
+  if (p === "probe" || p === "hunt") return "pipeProbe";
+  if (p === "adc" || p === "adc-sub" || p === "osc" || p === "osc-x") return "pipeSweep";
+  if (p === "fuse") return "pipeFuse";
+  if (p === "lock-osc" || p === "lock-adc") return "pipeSweep";
+  return null;
+}
+function setPipeline(stepId) {
+  const order = ["pipeProbe", "pipeSweep", "pipeFuse"];
+  const idx = order.indexOf(stepId);
+  order.forEach((id, i) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.classList.toggle("active", idx >= 0 && i === idx);
+    el.classList.toggle("done", idx >= 0 && i < idx);
+  });
+}
+
+// Range-decision matrix: which ranges were swept and what each method returned.
+function renderMatrix() {
+  const tb = document.querySelector("#rangeMatrix tbody");
+  if (!tb) return;
+  const sw = state.sweep, fu = state.fusion;
+  const contrib = (fu && fu.contrib) || [];
+  const byRM = (method, r) => contrib.find((c) => c.m === method && c.r === r);
+  const cell = (c, method) => {
+    if (!c) return `<td class="cell dim">—</td>`;
+    const badge = c.kept ? `<span class="badge kept">kept</span>`
+                         : `<span class="badge gated">gated</span>`;
+    const w = Math.max(0, Math.min(1, c.w || 0));
+    const bar = `<span class="qbar" style="width:${(6 + w * 34).toFixed(0)}px"></span>`;
+    return `<td class="cell" title="q ${fmt(c.q, 3)} · w ${fmt(c.w, 3)}">${formatCap(c.c)} ${bar} ${badge}${method === "adc" ? `<div class="dim">R² ${fmt(c.r2, 3)}</div>` : ""}</td>`;
+  };
+  let rows = "";
+  for (let r = 0; r < 4; r++) {
+    const adcTried = sw ? !!sw.adc_tried[r] : false;
+    const isBest = sw && sw.osc_best === r;
+    const adcC = byRM("adc", r);
+    const oscC = byRM("osc", r);
+    const adcCell = adcC ? cell(adcC, "adc")
+                         : (adcTried ? `<td class="cell dim">tried · no sample</td>` : `<td class="cell dim">skip${sw && sw.sub_nf ? " (sub-nF)" : ""}</td>`);
+    const oscCell = oscC ? cell(oscC, "osc")
+                         : (isBest ? `<td class="cell dim">tried · no sample</td>` : `<td class="cell dim">—</td>`);
+    rows += `<tr class="${isBest ? "best" : ""}"><td>${esc(RANGE_LABELS[r])}${isBest ? " ★" : ""}</td>${adcCell}${oscCell}</tr>`;
   }
+  tb.innerHTML = rows;
+
+  const sm = document.getElementById("sweepMeta");
+  if (!sw) { sm.textContent = "no sweep yet"; return; }
+  const bits = [];
+  bits.push(sw.mode === "locked" ? `locked ${RANGE_LABELS[sw.lock] || sw.lock}` : "autorange");
+  if (sw.have_rough) bits.push(`probe ${formatCap(sw.rough)}`);
+  else bits.push("no probe estimate");
+  if (sw.sub_nf) bits.push("sub-nF → oscillator only");
+  if (sw.saturated) bits.push("100 Ω saturated → 100 kΩ sub");
+  sm.textContent = bits.join(" · ");
+}
+
+function renderFusionStrip() {
+  const el = document.getElementById("fusionStrip");
+  const legend = document.getElementById("fusionLegend");
+  if (!el) return;
+  const fu = state.fusion;
+  const contrib = (fu && fu.contrib) || [];
+  if (!contrib.length) {
+    el.innerHTML = `<div class="dim" style="padding:18px 0">no fusion data yet — start a measurement.</div>`;
+    if (legend) legend.textContent = "no samples yet";
+    return;
+  }
+  const T = THEME;
+  const W = el.clientWidth || 620, H = 128;
+  const padL = 52, padR = 16, padT = 16, laneADC = 40, laneOSC = 92;
+  const vals = contrib.map((c) => c.c).filter((v) => v > 0);
+  const med = fu.median > 0 ? fu.median : (vals.length ? vals[0] : 1e-12);
+  vals.push(med);
+  if (fu.c > 0) vals.push(fu.c);
+  let xmin = Math.min(...vals), xmax = Math.max(...vals);
+  if (!(xmin > 0)) xmin = 1e-15;
+  if (xmax <= xmin) { xmin *= 0.5; xmax *= 2; }
+  const xminL = Math.log10(xmin), xmaxL = Math.log10(xmax);
+  const sx = (v) => {
+    const l = Math.log10(Math.max(v, 1e-18));
+    return padL + (xmaxL === xminL ? 0.5 : (l - xminL) / (xmaxL - xminL)) * (W - padL - padR);
+  };
+  let svg = `<svg width="${W}" height="${H}">`;
+  // ticks (log)
+  const nticks = 5;
+  for (let i = 0; i <= nticks; i++) {
+    const l = xminL + (i / nticks) * (xmaxL - xminL);
+    const x = sx(Math.pow(10, l));
+    svg += `<line x1="${x}" y1="${padT}" x2="${x}" y2="${H - 12}" stroke="${T.grid}"/>`;
+    svg += `<text x="${x}" y="${H - 1}" fill="${T.dim}" font-size="9" text-anchor="middle">${formatCap(Math.pow(10, l))}</text>`;
+  }
+  // median gate band
+  const lo = med * (1 - (fu.gate_rel || 0.875)), hi = med * (1 + (fu.gate_rel || 0.875));
+  svg += `<rect x="${sx(lo)}" y="${padT}" width="${Math.max(1, sx(hi) - sx(lo))}" height="${H - 12 - padT}" fill="${T.grid}"/>`;
+  // lanes
+  svg += `<line x1="${padL}" y1="${laneADC}" x2="${W - padR}" y2="${laneADC}" stroke="${T.grid}"/>`;
+  svg += `<line x1="${padL}" y1="${laneOSC}" x2="${W - padR}" y2="${laneOSC}" stroke="${T.grid}"/>`;
+  svg += `<text x="${padL - 6}" y="${laneADC + 4}" fill="${T.adc}" font-size="10" text-anchor="end">ADC</text>`;
+  svg += `<text x="${padL - 6}" y="${laneOSC + 4}" fill="${T.osc}" font-size="10" text-anchor="end">OSC</text>`;
+  // median + fused markers
+  svg += `<line x1="${sx(med)}" y1="${padT}" x2="${sx(med)}" y2="${H - 12}" stroke="${T.dim}" stroke-dasharray="4 3"/>`;
+  svg += `<line x1="${sx(fu.c)}" y1="${padT - 6}" x2="${sx(fu.c)}" y2="${H - 12}" stroke="${T.accent}" stroke-width="2.5"/>`;
+  svg += `<text x="${sx(fu.c)}" y="${padT - 8}" fill="${T.accent}" font-size="10" text-anchor="middle">fused ${formatCap(fu.c)}</text>`;
+  // contributions
+  for (const c of contrib) {
+    const x = sx(c.c);
+    const y = c.m === "adc" ? laneADC : laneOSC;
+    const color = c.m === "adc" ? T.adc : T.osc;
+    const r = 4 + 8 * Math.max(0, Math.min(1, c.w || 0));
+    if (c.kept) {
+      svg += `<circle cx="${x}" cy="${y}" r="${r.toFixed(1)}" fill="${color}" fill-opacity="0.85" stroke="${color}"/>`;
+      svg += `<text x="${x}" y="${y + r + 11}" fill="${T.dim}" font-size="9" text-anchor="middle">${formatCap(c.c)}</text>`;
+    } else {
+      svg += `<circle cx="${x}" cy="${y}" r="${r.toFixed(1)}" fill="none" stroke="${T.err}" stroke-dasharray="3 2"/>`;
+      svg += `<line x1="${x - r}" y1="${y + r}" x2="${x + r}" y2="${y - r}" stroke="${T.err}"/>`;
+    }
+  }
+  svg += `</svg>`;
+  el.innerHTML = svg;
+
+  if (legend) {
+    const kept = contrib.filter((c) => c.kept).length;
+    legend.innerHTML = `<span class="legend-dot" style="background:${T.adc}"></span>ADC ` +
+      `<span class="legend-dot" style="background:${T.osc};margin-left:10px"></span>OSC ` +
+      `<span style="margin-left:10px">·</span> ${kept}/${contrib.length} kept · ` +
+      `median ${formatCap(fu.median)} · gate ±${((fu.gate_rel || 0.875) * 100).toFixed(1)}% · ` +
+      `gated ${fu.n_gated ?? 0}`;
+  }
+}
+
+function updateFusionMeta() {
+  const el = document.getElementById("fusionMeta");
+  const fu = state.fusion;
+  if (!el) return;
+  if (!fu) { el.textContent = "waiting for a cycle…"; return; }
+  el.textContent = `fused ${formatCap(fu.c)} · kept ${fu.n_kept ?? 0} (gated ${fu.n_gated ?? 0}) · ` +
+    `spread ${(fu.spread * 100).toFixed(1)}% · Σw ${fmt(fu.w_total, 2)}`;
+}
+
+// ---------------------------------------------------------------- UI updates
+function clearChart(c) {
+  c.xs = [];
+  c.data = c.seriesDef.map(() => []);
+  c.last = {};
+  c.started = false;
+  c.u.setData([[], ...c.seriesDef.map(() => [])]);
+}
+function resetCharts() {
+  for (const c of Object.values(charts)) clearChart(c);
   curveU.setData([[], [], []]);
 }
-// Clear every client-side series so a reconnect / device reboot cannot
-// double-count replayed history into the rolling average or the charts.
 function resetClientState() {
   state.cvals = [];
   state.curSamples = [];
   state.lastCalres = null;
+  state.sweep = null;
+  state.fusion = null;
+  state.errSeries = [];
   calPoints.length = 0;
   state.adcPoints = [];
   resetCharts();
   renderCal();
   renderAdcCal();
   renderSampleTable();
+  renderMatrix();
+  renderFusionStrip();
+  updateFusionMeta();
+  updateAccuracy(null);
   updateCapReadout(null);
 }
 function onBoot(ev) {
@@ -340,19 +559,21 @@ function renderAdcCal() {
   if (!el) return;
   const pts = state.adcPoints;
   if (!pts.length) { el.innerHTML = ""; return; }
-  const W = el.clientWidth || 360, H = 180, pad = 40;
+  const T = THEME;
+  const W = el.clientWidth || 360, H = 180, pad = 44, padR = 12, padT = 14, padB = 26;
   const xs = pts.map((p) => p.x), ys = pts.map((p) => p.y);
   const xmin = Math.min(...xs), xmax = Math.max(...xs);
   const ymin = Math.min(...ys), ymax = Math.max(...ys);
-  const sx = (x) => pad + (xmax === xmin ? 0.5 : (x - xmin) / (xmax - xmin)) * (W - pad - 10);
-  const sy = (y) => H - pad + 12 - (ymax === ymin ? 0.5 : (y - ymin) / (ymax - ymin)) * (H - pad - 12);
+  const sx = (x) => pad + (xmax === xmin ? 0.5 : (x - xmin) / (xmax - xmin)) * (W - pad - padR);
+  const sy = (y) => (H - padB) - (ymax === ymin ? 0.5 : (y - ymin) / (ymax - ymin)) * (H - padB - padT);
   let svg = `<svg width="${W}" height="${H}">`;
-  svg += `<line x1="${pad}" y1="${H - pad + 12}" x2="${W - 10}" y2="${H - pad + 12}" stroke="#2b3442"/>`;
-  svg += `<line x1="${pad}" y1="8" x2="${pad}" y2="${H - pad + 12}" stroke="#2b3442"/>`;
+  svg += `<line x1="${pad}" y1="${H - padB}" x2="${W - padR}" y2="${H - padB}" stroke="${T.axis}"/>`;
+  svg += `<line x1="${pad}" y1="${padT}" x2="${pad}" y2="${H - padB}" stroke="${T.axis}"/>`;
+  svg += `<text x="${pad}" y="11" fill="${T.dim}" font-size="10">τ (µs)</text>`;
+  svg += `<text x="${W - padR}" y="11" fill="${T.dim}" font-size="10" text-anchor="end">C_ref (pF)</text>`;
   for (const p of pts) {
-    svg += `<circle cx="${sx(p.x)}" cy="${sy(p.y)}" r="4" fill="${RANGE_COLORS[p.range] || "#fff"}"/>`;
+    svg += `<circle cx="${sx(p.x)}" cy="${sy(p.y)}" r="4" fill="${T.range[p.range] || "#fff"}"/>`;
   }
-  svg += `<text x="${pad}" y="12" fill="#8b949e" font-size="10">τ (µs) vs C_ref (pF)</text>`;
   svg += `</svg>`;
   el.innerHTML = svg;
 }
@@ -364,26 +585,40 @@ function renderCalTable() {
 function renderSampleTable() {
   const tb = document.querySelector("#sampleTable tbody");
   tb.innerHTML = state.curSamples.map((s) => {
-    const t = s.method === "adc" ? fmt(s.tau_us, 1) + " µs" : fmt(s.tau_us, 1) + " µs";
+    const t = fmt(s.tau_us, 1) + " µs";
     const second = s.method === "adc" ? "R² " + fmt(s.r2, 3) : fmt(s.freq, 1) + " Hz";
     const cls = s.plausible ? "ok" : (s.valid ? "bad" : "no");
     return `<tr><td>${esc(s.label || RANGE_LABELS[s.range])}</td><td>${esc(s.method)}</td><td class="${cls}">${s.plausible ? 'ok' : (s.valid ? 'reject' : 'fail')}</td>` +
       `<td>${formatCap(s.c)}</td><td>${fmt(s.q, 3)}</td><td>${t}</td><td>${second}</td></tr>`;
   }).join("") || `<tr><td colspan="7" class="dim">waiting for a cycle…</td></tr>`;
 }
+
+function updateConfidence(spread, valid) {
+  state.lastSpread = spread;
+  state.lastValid = valid;
+  const g = confFromSpread(valid ? spread : null);
+  const arc = document.getElementById("gaugeArc");
+  const circ = 2 * Math.PI * 52;
+  arc.style.strokeDashoffset = String(circ * (1 - g.frac));
+  arc.style.stroke = g.color;
+  document.getElementById("conf").textContent = g.label;
+  document.getElementById("confSub").textContent =
+    (spread != null && isFinite(spread)) ? `${(spread * 100).toFixed(1)}% spread` : "no reading";
+}
+
 function onCycle(ev) {
   if (ev.valid && ev.c > 0) {
     state.cvals.push(ev.c);
     if (state.cvals.length > AVG_HISTORY_MAX) state.cvals.shift();
   }
   updateCapReadout(ev);
-  document.getElementById("conf").textContent = ev.valid ? confFromSpread(ev.spread) : "—";
+  updateConfidence(ev.spread, ev.valid);
   document.getElementById("spread").textContent =
     (ev.spread != null && isFinite(ev.spread)) ? (ev.spread * 100).toFixed(1) + " %" : "—";
   document.getElementById("adcEst").textContent = formatCap(ev.adc);
   document.getElementById("oscEst").textContent = formatCap(ev.osc);
-  document.getElementById("nsamp").textContent =
-    `${ev.n_adc ?? "—"} / ${ev.n_osc ?? "—"}`;
+  document.getElementById("nsamp").textContent = `${ev.n_adc ?? "—"} / ${ev.n_osc ?? "—"}`;
+  updateActiveRange();
   document.getElementById("mismatch").classList.toggle("hidden", !ev.mismatch);
   charts.cap.set("fused", ev.valid ? ev.c * 1e12 : null);
   charts.cap.set("adc", ev.adc != null ? ev.adc * 1e12 : null);
@@ -392,10 +627,23 @@ function onCycle(ev) {
   charts.cap.set("avg", avg != null ? avg * 1e12 : null);
   charts.spread.set("spread", ev.spread * 100);
   renderSampleTable();
+  updateAccuracy(ev);
   state.curSamples = [];
+}
+function updateActiveRange() {
+  // Prefer the oscillator-nominated range, else the highest-quality sample range.
+  let r = state.sweep && state.sweep.osc_best >= 0 ? state.sweep.osc_best : null;
+  if (r == null && state.fusion && state.fusion.contrib) {
+    const kept = state.fusion.contrib.filter((c) => c.kept);
+    if (kept.length) r = kept[kept.length - 1].r;
+  }
+  document.getElementById("activeRange").textContent =
+    r != null ? (RANGE_LABELS[r] || r) : "—";
 }
 function onSample(ev) {
   state.curSamples.push(ev);
+  const step = phaseStep(ev.phase);
+  if (step) setPipeline(step);
   if (ev.plausible) {
     if (ev.method === "osc" && ev.freq > 0) charts.freq.set("r" + ev.range, ev.freq);
     if (ev.method === "adc" && ev.tau_us > 0) charts.tau.set("r" + ev.range, ev.tau_us);
@@ -409,6 +657,78 @@ function onTare(ev) {
   }
   charts.tare.set("r" + ev.range, ev.period_us);
 }
+
+// ---------------------------------------------------------------- sweep/fuse
+function onSweep(ev) {
+  state.sweep = ev;
+  state.fusion = null;   // a new cycle is starting; drop last cycle's breakdown
+  setPipeline(ev.have_rough ? "pipeSweep" : "pipeProbe");
+  renderMatrix();
+  updateFusionMeta();
+}
+function onFuse(ev) {
+  state.fusion = ev;
+  setPipeline("pipeFuse");
+  renderMatrix();
+  renderFusionStrip();
+  updateFusionMeta();
+  updateActiveRange();
+}
+function onStat(ev) {
+  state.stat = ev;
+  document.getElementById("stUptime").textContent = fmtDuration(ev.uptime_ms);
+  document.getElementById("stCycles").textContent = ev.cycles ?? "—";
+  document.getElementById("stCycleMs").textContent =
+    ev.cycle_ms != null ? ev.cycle_ms + " ms" : "—";
+  document.getElementById("stHeap").textContent =
+    ev.heap_free != null ? (ev.heap_free / 1024).toFixed(1) + " KB" : "—";
+}
+function fmtDuration(ms) {
+  if (ms == null || !isFinite(ms)) return "—";
+  const s = Math.floor(ms / 1000);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  return (h ? h + "h " : "") + (h || m ? m + "m " : "") + sec + "s";
+}
+
+// ------------------------------------------------------------- accuracy panel
+function dutRefF() { return state.dutRefF; }
+function updateAccuracy(ev) {
+  const nom = dutRefF();
+  const pill = document.getElementById("dutRefPill");
+  if (nom == null || !(nom > 0)) {
+    if (pill) pill.classList.add("hidden");
+    document.getElementById("accMeas").textContent = "—";
+    document.getElementById("accErr").textContent = "—";
+    document.getElementById("accPpm").textContent = "—";
+    document.getElementById("accStdev").textContent = "—";
+    document.getElementById("accN").textContent = state.errSeries.length || "—";
+    return;
+  }
+  if (pill) {
+    pill.classList.remove("hidden");
+    pill.textContent = formatCap(nom) + " nominal";
+  }
+  let measured = null;
+  if (ev && ev.valid && ev.c > 0) measured = ev.c;
+  else if (state.cvals.length) measured = rollingAvg(avgWindow()) || state.cvals[state.cvals.length - 1];
+  if (measured != null) {
+    const err = (measured - nom) / nom;
+    state.errSeries.push(err);
+    if (state.errSeries.length > AVG_HISTORY_MAX) state.errSeries.shift();
+    document.getElementById("accMeas").textContent = formatCap(measured);
+    document.getElementById("accErr").textContent = (err * 100).toFixed(3) + " %";
+    document.getElementById("accPpm").textContent = Math.round(err * 1e6).toLocaleString();
+    charts.err.set("err", err * 100);
+  }
+  if (state.errSeries.length > 1) {
+    const n = state.errSeries.length;
+    const mean = state.errSeries.reduce((a, b) => a + b, 0) / n;
+    const sd = Math.sqrt(state.errSeries.reduce((a, b) => a + (b - mean) ** 2, 0) / n);
+    document.getElementById("accStdev").textContent = (sd * 100).toFixed(3) + " %";
+  }
+  document.getElementById("accN").textContent = state.errSeries.length;
+}
+
 // ------------------------------------------------- front-end / safety state
 function updateFe(ev) {
   state.fe = ev;
@@ -456,8 +776,7 @@ function updateFe(ev) {
     bd.classList.toggle("on", !!ev.auto_dis);
   }
 }
-// No telemetry: the front-end state is unknown, not "safe".  Never let a stale
-// "IDLE" badge imply the DUT is discharged after a link drop.
+// No telemetry: the front-end state is unknown, not "safe".
 function markFeStale() {
   const badge = document.getElementById("feState");
   badge.textContent = "UNKNOWN";
@@ -483,18 +802,62 @@ function onEvent(ev) {
     case "calres": onCalres(ev); break;
     case "adccalpt": onAdccalpt(ev); break;
     case "adccalres": onAdccalres(ev); break;
+    case "sweep": onSweep(ev); break;
+    case "fuse": onFuse(ev); break;
+    case "stat": onStat(ev); break;
     case "fe": updateFe(ev); break;
     case "ack": onAck(ev); break;
   }
 }
 
+// ---------------------------------------------------------------- theming UI
+function applyTheme(name) {
+  THEME = THEMES[name] || THEMES.dark;
+  document.documentElement.setAttribute("data-theme", name);
+  try { localStorage.setItem("eswcap-theme", name); } catch (e) {}
+  document.getElementById("btnTheme").textContent = name === "dark" ? "Light" : "Dark";
+  for (const c of Object.values(charts)) c.rebuild();
+  if (curveU) { curveU.destroy(); }
+  mountCurve();
+  if (state.lastCurve) onCurve(state.lastCurve);
+  renderCal();
+  renderAdcCal();
+  renderFusionStrip();
+  updateConfidence(state.lastSpread, state.lastValid);
+  renderMatrix();
+}
+function togglePresent() {
+  const on = document.body.classList.toggle("present");
+  document.getElementById("btnPresent").classList.toggle("on", on);
+  try { localStorage.setItem("eswcap-present", on ? "1" : "0"); } catch (e) {}
+  setTimeout(resizeAll, 60);
+}
+
+// -------------------------------------------------------------------- share
+function renderShare() {
+  const urls = state.urls && state.urls.length ? state.urls : [location.origin];
+  const listEl = document.getElementById("shareUrls");
+  listEl.innerHTML = urls.map((u) =>
+    `<div><a href="${esc(u)}" target="_blank" rel="noopener">${esc(u)}</a></div>`).join("");
+  const qrEl = document.getElementById("shareQr");
+  try {
+    const qr = qrcode(0, "M");
+    qr.addData(urls[0]);
+    qr.make();
+    qrEl.innerHTML = qr.createSvgTag({ cellSize: 3, margin: 0 });
+  } catch (e) {
+    qrEl.textContent = "";
+  }
+}
+
 // ---------------------------------------------------------------- websocket
 let ws = null;
-function setLink(on, port, err) {
+function setLink(on, port, err, urls) {
   const el = document.getElementById("link");
   el.textContent = on ? "connected" : (err ? "disconnected" : "connecting…");
   el.className = "pill " + (on ? "on" : "off");
   document.getElementById("port").textContent = port || "—";
+  if (urls && urls.length) state.urls = urls;
 }
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -503,9 +866,10 @@ function connect() {
   ws.onclose = () => { setLink(false, null, true); markFeStale(); setTimeout(connect, 1500); };
   ws.onerror = () => {};
   ws.onmessage = (m) => {
+    msgCount++;
     let msg;
     try { msg = JSON.parse(m.data); } catch { return; }
-    if (msg.type === "status") setLink(msg.connected, msg.port, msg.error);
+    if (msg.type === "status") setLink(msg.connected, msg.port, msg.error, msg.urls);
     else if (msg.type === "reset") resetClientState();
     else if (msg.type === "event") onEvent(msg.event);
     else if (msg.type === "log") appendLog(msg.line);
@@ -521,9 +885,16 @@ function calCmd(c) {
 const logEl = () => document.getElementById("log");
 function appendLog(line) {
   const el = logEl();
-  el.textContent += line + "\n";
-  const lines = el.textContent.split("\n");
-  if (lines.length > 1000) el.textContent = lines.slice(-1000).join("\n");
+  // Colour ESP_LOG severities so the console reads at a glance.
+  let cls = "";
+  if (/\bE \(/.test(line) || /error/i.test(line)) cls = "lv-err";
+  else if (/\bW \(/.test(line) || /warn/i.test(line)) cls = "lv-warn";
+  const span = document.createElement("span");
+  if (cls) span.className = cls;
+  span.textContent = line + "\n";
+  el.appendChild(span);
+  const lines = el.childNodes;
+  if (lines.length > 1000) el.removeChild(lines[0]);
   el.scrollTop = el.scrollHeight;
 }
 
@@ -613,11 +984,45 @@ document.getElementById("btnSend").onclick = () => {
 document.getElementById("cmdInput").addEventListener("keydown", (e) => {
   if (e.key === "Enter") document.getElementById("btnSend").click();
 });
-window.addEventListener("resize", () => {
-  Object.values(charts).forEach((c) => c.resize());
-  curveU.setSize({ width: document.getElementById("curveChart").clientWidth || 400, height: 200 });
-  renderCal();
+
+// theme / presentation / share
+document.getElementById("btnTheme").onclick = () => {
+  const next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+  applyTheme(next);
+};
+document.getElementById("btnPresent").onclick = togglePresent;
+document.getElementById("btnShare").onclick = () => {
+  const box = document.getElementById("shareBox");
+  box.classList.toggle("hidden");
+  if (!box.classList.contains("hidden")) renderShare();
+};
+document.getElementById("btnShareClose").onclick = () =>
+  document.getElementById("shareBox").classList.add("hidden");
+
+// accuracy nominal
+document.getElementById("dutRef").addEventListener("input", (e) => {
+  const pf = capToPf(e.target.value);
+  state.dutRefF = isFinite(pf) && pf > 0 ? pf * 1e-12 : null;
+  state.errSeries = [];
+  clearChart(charts.err);
+  updateAccuracy(null);
 });
+document.getElementById("btnDutClear").onclick = () => {
+  document.getElementById("dutRef").value = "";
+  state.dutRefF = null;
+  state.errSeries = [];
+  clearChart(charts.err);
+  updateAccuracy(null);
+};
+
+function resizeAll() {
+  Object.values(charts).forEach((c) => c.resize());
+  curveU.setSize({ width: document.getElementById("curveChart").clientWidth || 400, height: 220 });
+  renderCal();
+  renderAdcCal();
+  renderFusionStrip();
+}
+window.addEventListener("resize", resizeAll);
 
 // Flush sample-and-hold once per tick so multi-range lines stay continuous.
 setInterval(() => {
@@ -633,7 +1038,41 @@ setInterval(() => {
   });
 }, 500);
 
+// Telemetry throughput (IoT link health).
+let msgCount = 0, lastMsgCount = 0, lastMsgT = Date.now();
+setInterval(() => {
+  const now = Date.now();
+  const dt = (now - lastMsgT) / 1000;
+  const rate = dt > 0 ? (msgCount - lastMsgCount) / dt : 0;
+  lastMsgCount = msgCount; lastMsgT = now;
+  const el = document.getElementById("stMsgRate");
+  if (el) el.textContent = rate.toFixed(1) + " msg/s";
+}, 1000);
+
+// ---------------------------------------------------------------- init
+(function init() {
+  const params = new URLSearchParams(location.search);
+  const savedTheme = (() => { try { return localStorage.getItem("eswcap-theme"); } catch (e) { return null; } })();
+  const theme = params.get("theme") || savedTheme || "dark";
+  THEME = THEMES[theme] || THEMES.dark;
+  document.documentElement.setAttribute("data-theme", THEME === THEMES.light ? "light" : "dark");
+  document.getElementById("btnTheme").textContent = THEME === THEMES.light ? "Dark" : "Light";
+  const present = params.has("present")
+    ? params.get("present") !== "0"
+    : (() => { try { return localStorage.getItem("eswcap-present") === "1"; } catch (e) { return false; } })();
+  if (present) { document.body.classList.add("present"); document.getElementById("btnPresent").classList.add("on"); }
+  // Widgets that were created before init with the dark theme are rebuilt now
+  // so the saved theme is reflected on first paint.
+  for (const c of Object.values(charts)) c.rebuild();
+  if (curveU) curveU.destroy();
+  mountCurve();
+})();
+
 connect();
 renderSampleTable();
+renderMatrix();
+renderFusionStrip();
+updateFusionMeta();
+updateAccuracy(null);
 updateCapReadout(null);
 renderAdcCalTable();

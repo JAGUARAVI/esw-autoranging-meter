@@ -1,24 +1,46 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>ESWCap — Capacitance Dashboard</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%231f3a5f'/%3E%3Ctext x='16' y='23' font-size='17' font-family='sans-serif' font-weight='bold' text-anchor='middle' fill='%23ffffff'%3EE%3C/text%3E%3C/svg%3E" />
 <link rel="stylesheet" href="/static/vendor/uPlot.min.css" />
 <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
 <header>
-  <h1>ESWCap <span class="sub">autoranging capacitance meter</span></h1>
+  <div class="brand">
+    <span class="logo">ESW</span>
+    <h1>ESWCap <span class="sub">autoranging capacitance meter</span></h1>
+  </div>
   <div class="status">
     <span id="link" class="pill off">connecting…</span>
     <span id="port" class="mono dim">—</span>
+    <button class="btn small" id="btnShare" title="Open this dashboard on a phone / tablet">Share</button>
+    <button class="btn small" id="btnPresent" title="Hide diagnostics, enlarge the demo view">Present</button>
+    <button class="btn small" id="btnTheme" title="Toggle light / dark theme">Light</button>
     <a class="btn small" href="/api/export.csv">Export CSV</a>
   </div>
 </header>
 
-<section class="readout">
-  <div class="big">
+<!-- LAN / mobile access drawer -->
+<div id="shareBox" class="share hidden">
+  <div class="share-head">Open this dashboard on a phone or tablet on the same Wi-Fi</div>
+  <div class="share-body">
+    <div id="shareQr" class="qr"></div>
+    <div class="share-info">
+      <div id="shareUrls" class="mono"></div>
+      <div class="dim">The host must be started with <code>--host 0.0.0.0</code> to allow LAN access.
+        Multiple devices can watch and drive the same instrument at once.</div>
+      <button class="btn ghost small" id="btnShareClose">Close</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============================ HERO ============================ -->
+<section class="hero">
+  <div class="card big">
     <div class="label">Capacitance
       <select id="avgWindow" class="avgsel" title="Show a rolling average of the last N valid readings">
         <option value="1">instant</option>
@@ -32,16 +54,58 @@
     <div id="capMeta" class="meta dim">waiting for telemetry…</div>
     <div id="capHistory" class="meta dim"></div>
   </div>
+
+  <div class="card gauge-card">
+    <div class="label">Confidence</div>
+    <svg id="confGauge" viewBox="0 0 120 120" class="gauge" aria-hidden="true">
+      <circle class="gauge-bg" cx="60" cy="60" r="52"></circle>
+      <circle id="gaugeArc" class="gauge-arc" cx="60" cy="60" r="52"></circle>
+    </svg>
+    <div id="conf" class="gauge-val">—</div>
+    <div id="confSub" class="meta dim">no reading</div>
+  </div>
+
   <div class="stats">
-    <div class="stat"><div class="k">Confidence</div><div id="conf" class="v mono">—</div></div>
     <div class="stat"><div class="k">Spread</div><div id="spread" class="v mono">—</div></div>
     <div class="stat"><div class="k">ADC estimate</div><div id="adcEst" class="v mono">—</div></div>
     <div class="stat"><div class="k">OSC estimate</div><div id="oscEst" class="v mono">—</div></div>
-    <div class="stat"><div class="k">Samples</div><div id="nsamp" class="v mono">—</div></div>
+    <div class="stat"><div class="k">Samples (ADC/OSC)</div><div id="nsamp" class="v mono">—</div></div>
+    <div class="stat"><div class="k">Active range</div><div id="activeRange" class="v mono">—</div></div>
   </div>
 </section>
 <div id="mismatch" class="warn hidden">ADC and OSC disagree beyond uncertainty — inspect DUT / re-run calibration.</div>
 
+<!-- ==================== AUTORANGING & FUSION ==================== -->
+<section class="card fusion-card">
+  <h2>Autoranging &amp; fusion <span class="dim">— how every sample becomes one estimate</span></h2>
+
+  <div class="pipeline" id="pipeline">
+    <div class="step" id="pipeProbe"><span class="dot"></span><span class="step-main">PROBE</span><small>rough estimate</small></div>
+    <div class="arrow">›</div>
+    <div class="step" id="pipeSweep"><span class="dot"></span><span class="step-main">SWEEP</span><small>range × method</small></div>
+    <div class="arrow">›</div>
+    <div class="step" id="pipeFuse"><span class="dot"></span><span class="step-main">FUSE</span><small>weighted merge</small></div>
+    <div class="fusion-meta" id="fusionMeta">waiting for a cycle…</div>
+  </div>
+
+  <div class="fusion-main">
+    <div class="matrix-wrap">
+      <div class="kicker">Range decision matrix</div>
+      <table id="rangeMatrix" class="matrix">
+        <thead><tr><th>Range</th><th>ADC</th><th>OSC</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div id="sweepMeta" class="meta dim">no sweep yet</div>
+    </div>
+    <div class="strip-wrap">
+      <div class="kicker">Fusion strip <span class="dim">— bar width ∝ quality weight, log value axis</span></div>
+      <div id="fusionStrip" class="fusion-strip"></div>
+      <div id="fusionLegend" class="fusion-legend dim">no samples yet</div>
+    </div>
+  </div>
+</section>
+
+<!-- ========================= CONTROLS ========================= -->
 <section class="controls">
   <div class="group">
     <span class="glabel">Measurement</span>
@@ -66,38 +130,69 @@
   </div>
 </section>
 
-<section class="safety" id="safetyPanel">
-  <div class="safety-col">
-    <div class="k">Front-end state</div>
-    <div id="feState" class="fe-badge idle">IDLE</div>
-    <div id="feDetail" class="meta dim">waiting for device…</div>
-  </div>
-  <div class="safety-col">
-    <div class="k">Power switches</div>
-    <div class="bits">
-      <span class="bit" id="bitSSR13" title="SSR1 pre-charge + SSR3 V_cap clamp (shared pin)">SSR1+SSR3</span>
-      <span class="bit" id="bitSSR2" title="SSR2 discharge">SSR2</span>
-      <span class="bit" id="bitDrive" title="SN74LVC1G34 drive">DRIVE</span>
+<!-- ==================== LIVE HARDWARE / SAFETY ==================== -->
+<section class="card hw-card" id="safetyPanel">
+  <h2>Live hardware <span class="dim">— front-end state &amp; GPIO</span></h2>
+  <div class="hw-grid">
+    <div class="safety-col">
+      <div class="k">Front-end state</div>
+      <div id="feState" class="fe-badge idle">IDLE</div>
+      <div id="feDetail" class="meta dim">waiting for device…</div>
     </div>
-    <div class="meta dim">SSR1 and SSR3 share one GPIO — charging always clamps V_cap.</div>
+    <div class="safety-col">
+      <div class="k">Power switches</div>
+      <div class="bits">
+        <span class="bit" id="bitSSR13" title="SSR1 pre-charge + SSR3 V_cap clamp (shared pin)">SSR1+SSR3</span>
+        <span class="bit" id="bitSSR2" title="SSR2 discharge">SSR2</span>
+        <span class="bit" id="bitDrive" title="SN74LVC1G34 drive">DRIVE</span>
+      </div>
+      <div class="meta dim">SSR1 and SSR3 share one GPIO — charging always clamps V_cap.</div>
+    </div>
+    <div class="safety-col actions">
+      <div class="k">Front-end power</div>
+      <button class="btn danger" id="btnPrecharge">Pre-charge C_block</button>
+      <button class="btn" id="btnDischarge">Discharge</button>
+      <button class="btn ghost" id="btnIdle">Idle (all off)</button>
+    </div>
+    <div class="safety-col actions">
+      <div class="k">Automation</div>
+      <button class="btn ghost" id="btnAutoPre">Auto pre-charge: OFF</button>
+      <button class="btn ghost" id="btnAutoDis">Auto discharge: OFF</button>
+      <div class="meta dim">Default OFF (manual). AUTO PRE re-biases the DUT before each
+        measurement cycle; AUTO DIS bleeds the node when a run ends.</div>
+    </div>
   </div>
-  <div class="safety-col actions">
-    <div class="k">Front-end power</div>
-    <button class="btn danger" id="btnPrecharge">Pre-charge C_block</button>
-    <button class="btn" id="btnDischarge">Discharge</button>
-    <button class="btn ghost" id="btnIdle">Idle (all off)</button>
+  <div class="hw-stats">
+    <span>uptime <b id="stUptime" class="mono">—</b></span>
+    <span>cycles <b id="stCycles" class="mono">—</b></span>
+    <span>last cycle <b id="stCycleMs" class="mono">—</b></span>
+    <span>heap free <b id="stHeap" class="mono">—</b></span>
+    <span>telemetry <b id="stMsgRate" class="mono">—</b></span>
   </div>
-  <div class="safety-col actions">
-    <div class="k">Automation</div>
-    <button class="btn ghost" id="btnAutoPre">Auto pre-charge: OFF</button>
-    <button class="btn ghost" id="btnAutoDis">Auto discharge: OFF</button>
-    <div class="meta dim">Default OFF (manual). AUTO PRE re-biases the DUT before each
-      measurement cycle; AUTO DIS bleeds the node when a run ends.</div>
-  </div>
+  <div id="feWarn" class="warn hidden"></div>
 </section>
-<div id="feWarn" class="warn hidden"></div>
 <div id="toasts" class="toasts"></div>
 
+<!-- ==================== ACCURACY / VALIDATION ==================== -->
+<section class="card acc-card">
+  <h2>Accuracy vs reference <span class="dim">— live validation</span></h2>
+  <div class="acc-row">
+    <label>Nominal DUT</label>
+    <input id="dutRef" class="mono" type="text" placeholder="e.g. 100p, 10n, 4.7u" autocomplete="off" />
+    <span id="dutRefPill" class="pill on hidden"></span>
+    <button class="btn ghost small" id="btnDutClear">Clear</button>
+  </div>
+  <div class="stats acc-readouts">
+    <div class="stat"><div class="k">Measured</div><div id="accMeas" class="v mono">—</div></div>
+    <div class="stat"><div class="k">Error</div><div id="accErr" class="v mono">—</div></div>
+    <div class="stat"><div class="k">Error (ppm)</div><div id="accPpm" class="v mono">—</div></div>
+    <div class="stat"><div class="k">Session stdev</div><div id="accStdev" class="v mono">—</div></div>
+    <div class="stat"><div class="k">Valid cycles</div><div id="accN" class="v mono">—</div></div>
+  </div>
+  <div id="errChart" class="plot"></div>
+</section>
+
+<!-- =========================== CHARTS =========================== -->
 <section class="grid">
   <div class="card wide">
     <h2>Capacitance vs time <span class="dim">(log, pF)</span></h2>
@@ -137,9 +232,10 @@
   </div>
 </section>
 
+<!-- ==================== DIAGNOSTICS (collapsible) ==================== -->
 <section class="grid two">
-  <div class="card">
-    <h2>Calibration</h2>
+  <details class="card details-card" open>
+    <summary><h2>Calibration</h2></summary>
     <div class="calrow">
       <label>Target range</label>
       <select id="calRange">
@@ -201,7 +297,7 @@
     </div>
     <div id="adcCalTable" class="caltable mono"></div>
     <div id="adcCalChart" class="calcplot"></div>
-  </div>
+  </details>
 
   <div class="card">
     <h2>Current cycle samples</h2>
@@ -214,16 +310,17 @@
   </div>
 </section>
 
-<section class="card">
-  <h2>Command console &amp; log</h2>
+<details class="card details-card console-card">
+  <summary><h2>Command console &amp; log</h2></summary>
   <div class="console">
     <input id="cmdInput" class="mono" placeholder="type a firmware command (h for help)…" autocomplete="off" />
     <button class="btn" id="btnSend">Send</button>
   </div>
   <pre id="log" class="log mono"></pre>
-</section>
+</details>
 
 <script src="/static/vendor/uPlot.iife.min.js"></script>
+<script src="/static/vendor/qrcode.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

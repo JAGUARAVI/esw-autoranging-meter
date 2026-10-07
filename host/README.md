@@ -21,7 +21,10 @@ offline.
 ```bash
 host/run.sh                      # autodetect /dev/ttyACM* or /dev/ttyUSB*
 host/run.sh --port /dev/ttyACM0  # explicit port
+host/run.sh --host 0.0.0.0       # also serve on the LAN (phone / tablet demo)
 ```
+
+Deep-link a theme / presentation view, e.g. `http://127.0.0.1:8000/?theme=light&present=1`.
 
 Then open <http://127.0.0.1:8000>.
 
@@ -45,7 +48,42 @@ Every chart is fed only by real firmware telemetry — nothing is synthesised.
 | Current-cycle samples table | `sample` | full `sample_t` |
 | Rolling average (client-side) | `cycle` | last N fused values (instant / 3 / 5 / 10 / 20) |
 | Front-end state badge + SSR bits | `fe` | `state`, `ssr13`, `ssr2`, `drive`, `charged`, `discharged`, `auto_pre`, `auto_dis` |
+| Autoranging decision matrix + pipeline | `sweep` | `mode`, `have_rough`, `rough`, `sub_nf`, `saturated`, `adc_sub`, `osc_best`, `lock`, `adc_tried[]` |
+| Fusion strip + pipeline | `fuse` | `median`, `c`, `c_min`, `c_max`, `gate_rel`, `n_kept`, `n_gated`, `w_total`, `contrib[]` (`r`,`m`,`c`,`q`,`w`,`r2`,`kept`) |
+| Device health (uptime / heap / cycle) | `stat` | `uptime_ms`, `cycles`, `cycle_ms`, `heap_free`, `heap_min` |
 | Confirmation toasts | `ack` | `cmd`, `ok`, `msg` |
+
+## Presentation features
+
+The dashboard is also built to be projected.
+
+- **Fusion panel** — the three-phase pipeline (PROBE → SWEEP → FUSE) lights up
+  live from the firmware's `phase`, the **range decision matrix** shows which
+  (range, method) cells were swept and how each sample scored, and the **fusion
+  strip** plots every contributing sample on a log axis with a bar whose width
+  is its quality *weight*, the median, the ±87.5 % gate band and the fused
+  result. Gated outliers are struck through. This makes the quality-scored
+  fusion — the project's core idea — visible.
+- **Accuracy vs reference** — type a nominal DUT value (unit suffixes `p`/`n`/`u`
+  accepted, e.g. `100p`, `10n`, `4.7u`) and the panel shows measured vs nominal,
+  **error %**, **ppm**, a running error trend chart and the session standard
+  deviation. Pending two-point calibration will obviously affect absolute error;
+  the numbers are real telemetry, not targets.
+- **Presentation mode** (`Present`) hides the calibration, console and diagnostic
+  charts and enlarges the headline view.
+- **Light / dark theme** (`Light`) switches between the dark console and a light
+  academic palette that matches the slide deck. Both can be deep-linked, e.g.
+  `/?theme=light&present=1`.
+- **Snapshot** — use the uPlot legend or the browser's screenshot; charts can
+  also be read from the CSV export.
+
+## LAN / mobile access (IoT demo)
+
+Start the host with `--host 0.0.0.0`; on startup it prints every LAN URL this
+dashboard is reachable at, and the header's **Share** button shows those URLs
+plus a **QR code** to open the live instrument on a phone or tablet. The
+WebSocket fan-out already supports several clients at once, so a laptop can run
+the console while a phone drives Start/Stop and watches the fusion strip.
 
 ## Front-end safety controls
 
@@ -110,8 +148,9 @@ the large caps that use those ranges. This is expected, not an error.
 3. For best slope accuracy, do a two-point calibration instead: insert a known
    reference, enter its value, **Capture 1**; swap to a second reference, enter
    it, **Capture 2**. This solves `K` and `T0` together.
-4. `Export CSV` downloads all accumulated cycles, samples, tare runs, and
-   calibration points.
+4. `Export CSV` downloads all accumulated cycles, samples, tare runs,
+   calibration points, **fusion breakdowns, autoranging decisions and device
+   stats** — the full dataset behind the live view.
 
 ### ADC (RC-step) series-resistance calibration
 
@@ -135,5 +174,6 @@ manage what is stored; the calibration persists in NVS.
 
 The firmware emits single-line JSON after a `@@EVT ` sentinel when streaming is
 enabled (`stream on`). Events: `boot`, `cycle`, `sample`, `curve`, `tare`,
-`calpt`, `calres`, `ack`. Human `ESP_LOG` lines are interleaved and shown in the
-log pane.
+`calpt`, `calres`, `adccalpt`, `adccalres`, `fe`, `ack`, plus `sweep`, `fuse`
+and `stat` (see the table above). Human `ESP_LOG` lines are interleaved and shown
+in the log pane.

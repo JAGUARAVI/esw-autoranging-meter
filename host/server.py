@@ -16,6 +16,7 @@ import asyncio
 import csv
 import io
 import json
+import socket
 import time
 from collections import deque
 from contextlib import asynccontextmanager
@@ -41,6 +42,10 @@ HIST = {
     "ack": deque(maxlen=2000),
     "adccalpt": deque(maxlen=2000),
     "adccalres": deque(maxlen=500),
+    # Fusion / autoranging telemetry for the presentation view.
+    "fuse": deque(maxlen=2000),
+    "sweep": deque(maxlen=1000),
+    "stat": deque(maxlen=500),
     # Waveform snapshots are large; keep a short tail so a late/reconnecting
     # client can still be handed the most recent curve.
     "curve": deque(maxlen=50),
@@ -59,6 +64,22 @@ def autodetect_port() -> str | None:
     return ports[0].device if ports else None
 
 
+def local_urls(port: int) -> list[str]:
+    """Best-effort list of LAN URLs this dashboard is reachable at, so a phone
+    or tablet on the same network can drive / watch the instrument."""
+    urls: list[str] = []
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))          # no packets sent; picks the route IP
+        ip = s.getsockname()[0]
+        s.close()
+        if ip and not ip.startswith("127."):
+            urls.append(f"http://{ip}:{port}")
+    except Exception:  # noqa: BLE001
+        pass
+    return urls
+
+
 class Hub:
     def __init__(self, port: str | None, baud: int):
         self.port = port
@@ -73,8 +94,10 @@ class Hub:
         self.latest: dict = {"cycle": None, "boot": None, "tare": None,
                              "calres": None, "calpt": None, "fe": None,
                              "ack": None, "adccalres": None, "adccalpt": None,
+                             "fuse": None, "sweep": None, "stat": None,
                              "curve": None}
         self.curve_requested = False
+        self.urls: list = []
 
     # ---- broadcast helpers -------------------------------------------------
     async def broadcast(self, message: dict) -> None:
@@ -103,6 +126,12 @@ class Hub:
                 continue  # large; sent once as a snapshot below
             for ev in list(dq)[-500:]:
                 await ws.send_json({"type": "event", "event": ev})
+        # History replays by event kind, not chronology, so the panel events must
+        # be re-sent as a final snapshot in dependency order or a late/reconnecting
+        # client could see a sweep with its fusion breakdown cleared.
+        for kind in ("sweep", "fuse", "stat", "fe", "calres", "adccalres"):
+            if self.latest.get(kind):
+                await ws.send_json({"type": "event", "event": self.latest[kind]})
         if self.latest["curve"]:
             await ws.send_json({"type": "event", "event": self.latest["curve"]})
         for line in list(self.log_lines)[-200:]:
@@ -129,7 +158,7 @@ class Hub:
 
     async def _set_status(self, connected: bool, **extra) -> None:
         self.status = {"connected": connected, "port": self.port,
-                       "baud": self.baud, **extra}
+                       "baud": self.baud, "urls": self.urls, **extra}
         await self.broadcast({"type": "status", **self.status})
 
     # ---- serial ------------------------------------------------------------
@@ -211,6 +240,18 @@ class Hub:
             elif kind == "adccalpt":
                 self.latest["adccalpt"] = ev
                 HIST["adccalpt"].append(ev)
+            elif kind == "fuse":
+                ev.setdefault("rx_unix_s", time.time())
+                self.latest["fuse"] = ev
+                HIST["fuse"].append(ev)
+            elif kind == "sweep":
+                ev.setdefault("rx_unix_s", time.time())
+                self.latest["sweep"] = ev
+                HIST["sweep"].append(ev)
+            elif kind == "stat":
+                ev.setdefault("rx_unix_s", time.time())
+                self.latest["stat"] = ev
+                HIST["stat"].append(ev)
             elif kind == "curve":
                 self.latest["curve"] = ev
                 HIST["curve"].append(ev)
@@ -241,6 +282,34 @@ def make_app(hub: Hub) -> FastAPI:
             "status": hub.status,
             "latest": hub.latest,
             "counts": {k: len(v) for k, v in HIST.items()},
+        })
+
+    @app.get("/api/summary")
+    async def summary():
+        """Session aggregate for the dashboard summary / presentation panel."""
+        cyc = list(HIST["cycle"])
+        cs = [c["c"] for c in cyc
+              if c.get("valid") and isinstance(c.get("c"), (int, float)) and c["c"] > 0]
+        spreads = [c["spread"] for c in cyc if isinstance(c.get("spread"), (int, float))]
+
+        def stats(xs):
+            if not xs:
+                return None
+            n = len(xs)
+            mean = sum(xs) / n
+            var = sum((x - mean) ** 2 for x in xs) / n
+            return {"n": n, "mean": mean, "min": min(xs),
+                    "max": max(xs), "stdev": var ** 0.5}
+
+        return JSONResponse({
+            "cycles": len(cyc),
+            "valid_cycles": len(cs),
+            "cap_F": stats(cs),
+            "spread": stats(spreads),
+            "fuse_events": len(HIST["fuse"]),
+            "samples": len(HIST["sample"]),
+            "stat": hub.latest.get("stat"),
+            "status": hub.status,
         })
 
     @app.get("/api/export.csv")
@@ -287,6 +356,44 @@ def make_app(hub: Hub) -> FastAPI:
             w.writerow(["calres", ev.get("op"), ev.get("range"), "", "", "",
                         ev.get("k"), ev.get("t0_us"), ev.get("ok")])
 
+        w.writerow([])
+        w.writerow(["# fusion breakdown"])
+        w.writerow(["rx_unix_s", "median_F", "fused_F", "c_min_F", "c_max_F",
+                    "spread", "n_kept", "n_gated", "w_total"])
+        for ev in HIST["fuse"]:
+            w.writerow([f"{ev.get('rx_unix_s', 0.0):.3f}", ev.get("median"), ev.get("c"),
+                        ev.get("c_min"), ev.get("c_max"), ev.get("spread"),
+                        ev.get("n_kept"), ev.get("n_gated"), ev.get("w_total")])
+
+        w.writerow([])
+        w.writerow(["# fusion contributions"])
+        w.writerow(["rx_unix_s", "range", "label", "method", "c_F", "c_eq_F",
+                    "q", "w", "r2", "kept"])
+        for ev in HIST["fuse"]:
+            ts = f"{ev.get('rx_unix_s', 0.0):.3f}"
+            for c in ev.get("contrib", []):
+                w.writerow([ts, c.get("r"), c.get("label"), c.get("m"),
+                            c.get("c"), c.get("c_eq"), c.get("q"), c.get("w"),
+                            c.get("r2"), c.get("kept")])
+
+        w.writerow([])
+        w.writerow(["# autoranging decisions"])
+        w.writerow(["rx_unix_s", "mode", "have_rough", "rough_F", "sub_nf",
+                    "saturated", "adc_sub", "osc_best", "lock", "adc_tried"])
+        for ev in HIST["sweep"]:
+            w.writerow([f"{ev.get('rx_unix_s', 0.0):.3f}", ev.get("mode"),
+                        ev.get("have_rough"), ev.get("rough"), ev.get("sub_nf"),
+                        ev.get("saturated"), ev.get("adc_sub"), ev.get("osc_best"),
+                        ev.get("lock"), ";".join(str(b) for b in ev.get("adc_tried", []))])
+
+        w.writerow([])
+        w.writerow(["# device stats"])
+        w.writerow(["rx_unix_s", "uptime_ms", "cycles", "cycle_ms", "heap_free", "heap_min"])
+        for ev in HIST["stat"]:
+            w.writerow([f"{ev.get('rx_unix_s', 0.0):.3f}", ev.get("uptime_ms"),
+                        ev.get("cycles"), ev.get("cycle_ms"), ev.get("heap_free"),
+                        ev.get("heap_min")])
+
         return StreamingResponse(
             iter([buf.getvalue()]), media_type="text/csv",
             headers={"Content-Disposition": "attachment; filename=eswcap.csv"})
@@ -330,6 +437,14 @@ def main() -> None:
 
     hub = Hub(args.port, args.baud)
     app = make_app(hub)
+
+    hub.urls = local_urls(args.web_port)
+    if hub.urls:
+        print("[host] dashboard also reachable on the LAN at:")
+        for u in hub.urls:
+            print("  " + u)
+        if args.host in ("127.0.0.1", "localhost"):
+            print("[host] (start with --host 0.0.0.0 to actually allow LAN access)")
 
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.web_port, log_level="info")

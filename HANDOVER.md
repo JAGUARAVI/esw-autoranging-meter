@@ -137,7 +137,10 @@ and `auto_pre`/`auto_dis` flags for the dashboard.
 
 Telemetry: with `stream on` the firmware prints single-line JSON after a
 `@@EVT ` sentinel (`boot`, `cycle`, `sample`, `curve`, `tare`, `calpt`,
-`calres`, `adccalpt`, `adccalres`, `fe`, `ack`); `curve on` adds the full ADC
+`calres`, `adccalpt`, `adccalres`, `fe`, `ack`). `sweep` reports the autoranging
+range/method decision, `fuse` reports the per-sample fusion breakdown (weights,
+median gate and fused value), and `stat` reports device health (uptime, completed
+cycles, last cycle time, free heap). `curve on` adds the full ADC
 charge curve (the host stores the latest and replays it to reconnecting
 clients). Human `ESP_LOG`
 lines are emitted alongside and are unaffected.
