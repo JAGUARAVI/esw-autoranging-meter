@@ -47,11 +47,62 @@ Every chart is fed only by real firmware telemetry — nothing is synthesised.
 | Tare stability (T0 per range) | `tare` | `period_us`, `t0_us` |
 | Current-cycle samples table | `sample` | full `sample_t` |
 | Rolling average (client-side) | `cycle` | last N fused values (instant / 3 / 5 / 10 / 20) |
-| Front-end state badge + SSR bits | `fe` | `state`, `ssr13`, `ssr2`, `drive`, `charged`, `discharged`, `auto_pre`, `auto_dis` |
+| Front-end state badge + SSR bits | `fe` | `state`, `ssr13`, `ssr2`, `drive`, `charged`, `discharged`, `auto_pre`, `auto_dis`, `run`, `single`, `lock` |
 | Autoranging decision matrix + pipeline | `sweep` | `mode`, `have_rough`, `rough`, `sub_nf`, `saturated`, `adc_sub`, `osc_best`, `lock`, `adc_tried[]` |
-| Fusion strip + pipeline | `fuse` | `median`, `c`, `c_min`, `c_max`, `gate_rel`, `n_kept`, `n_gated`, `w_total`, `contrib[]` (`r`,`m`,`c`,`q`,`w`,`r2`,`kept`) |
+| Fusion strip + pipeline | `fuse` | `median`, `c`, `c_min`, `c_max`, `spread`, `quality`, `mismatch_ratio`, `gate_rel`, `n_kept`, `n_gated`, `w_total`, `contrib[]` (`r`,`m`,`c`,`q`,`w`,`r2`,`kept`) |
 | Device health (uptime / heap / cycle) | `stat` | `uptime_ms`, `cycles`, `cycle_ms`, `heap_free`, `heap_min` |
 | Confirmation toasts | `ack` | `cmd`, `ok`, `msg` |
+
+## Precision instrument view (`/precision`)
+
+`/` is the full debug / presentation dashboard. `/precision` is an alternate,
+radical-transparency view for bench work: it answers *"What is the capacitance?"*
+and *"Can I trust this number?"* at a glance.
+
+- **Hero readout** — the fused capacitance in a large monospace face, with the
+  instant / avg 3 / avg 5 / avg 10 / avg 20 selector (default avg 5).
+- **Trust & provenance** — plain-text translation of the fusion state (agreement,
+  spread, active range/method, median-gate pass, fused quality, R², method
+  mismatch) instead of a confidence ring gauge. The panel's border-top carries
+  the active range colour.
+- **Front-end strip** — state, SSR1+SSR3 / SSR2 / DRIVE, auto-pre / auto-dis.
+- **Capacitance vs measurement cycle** — step interpolation, strictly log axis,
+  X = measurement index (idle time collapses), range-switch and tare markers.
+- **Controls** — a full control bar: **Start / Stop / Single** plus range lock
+  (`auto` / 100 Ω / 1 kΩ / 100 kΩ / 1 MΩ), front-end power (Pre-charge /
+  Discharge / Idle, with confirmations), the automation toggles, and the ADC
+  curve streaming switch. The firmware reports `run` / `single` / `lock` in
+  `@@EVT fe`, so the run-state chip and buttons follow the device.
+- **Pause on stop** — when measurement is stopped the timeline stops advancing
+  and the hero switches to a blue **HOLD** state ("Measurement stopped — last
+  value held") instead of the grey *staleness* fade. The grey "Data is Ns old"
+  dimming is reserved for *unexpected* telemetry loss while running.
+- **Recordings** — **Save CSV** (host `HIST` export), **Save JSON** (the exact
+  client-side cycles incl. fusion, samples and charge curves), and **Clear**
+  (POST `/api/clear` empties the host history and resets every client).
+- **Progressive disclosure** — fusion breakdown (weighted bar + 1-D spread
+  waterfall + sample table), ADC charge curve, calibration/tare and console all
+  start collapsed.
+- **ADC curve buckets** — charge curves are stored per resistance (range), up to
+  6 runs each. The panel has 100 Ω / 1 kΩ / 100 kΩ / 1 MΩ tabs with run counts;
+  the selected bucket shows its newest run as dots + the `fitted_exp` "ghost"
+  line, with older runs of the same resistance drawn faintly behind.
+- **Pin-to-explain** — clicking a historical timeline point freezes the live
+  view and loads that cycle's fusion and charge-curve telemetry.
+- **Alerts** — a persistent FAULT banner (offline, over-limit, missing cal),
+  rate-limited WARNING toasts, and INFO toasts for autorange / method handoff /
+  tare. A gate-rejected single outlier never raises a warning.
+- **Data-staleness fade** — the hero dims and shows *"Data is Ns old"* when
+  telemetry stops, or `NO LINK` when the device is gone.
+
+The view is laptop-first and touchscreen-safe (`@media (pointer: coarse)` bumps
+hit areas to 44 px). All charts are step/lie-free: no radial gauges, no splines.
+
+**Tare is not required on 100 Ω / 1 kΩ.** The oscillator tare `T0` only matters
+on 100 kΩ / 1 MΩ (an empty socket on the low ranges oscillates too fast to tare,
+and `T0` is negligible for the large capacitors those ranges serve). The
+precision view therefore labels those ranges **"tare n/a"** and never raises the
+"calibration missing" fault for an untared 100 Ω / 1 kΩ range.
 
 ## Presentation features
 
@@ -148,6 +199,11 @@ the large caps that use those ranges. This is expected, not an error.
 3. For best slope accuracy, do a two-point calibration instead: insert a known
    reference, enter its value, **Capture 1**; swap to a second reference, enter
    it, **Capture 2**. This solves `K` and `T0` together.
+
+All reference fields (OSC `cal`/`cal1`/`cal2` **and** ADC `adccal*`, on both the
+settings and precision views) accept unit suffixes — `p`, `n`, `u`, `m`, `f` —
+e.g. `100p`, `1n`, `4.7u`; a bare number is pF. They are converted to pF in the
+browser because the firmware's calibration commands take a plain pF value.
 4. `Export CSV` downloads all accumulated cycles, samples, tare runs,
    calibration points, **fusion breakdowns, autoranging decisions and device
    stats** — the full dataset behind the live view.
@@ -177,3 +233,13 @@ enabled (`stream on`). Events: `boot`, `cycle`, `sample`, `curve`, `tare`,
 `calpt`, `calres`, `adccalpt`, `adccalres`, `fe`, `ack`, plus `sweep`, `fuse`
 and `stat` (see the table above). Human `ESP_LOG` lines are interleaved and shown
 in the log pane.
+
+`cycle` and `fuse` now also carry the **fused `quality`** (the mean quality of
+the post-gate population) and the **`mismatch_ratio`** (`hi/lo` of the per-method
+estimates, `null` when only one method contributed). These are the fields the
+precision view uses for its trust translation and warning thresholds.
+
+`fe` also carries the autoranging run-state (`run`, `single`, `lock`), re-emitted
+on every `start` / `stop` / `single` / `auto` / `range` command and at the end of
+a single-shot, so the UI knows whether to expect data (live) or hold the last
+value.

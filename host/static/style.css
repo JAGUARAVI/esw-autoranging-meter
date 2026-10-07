@@ -113,6 +113,12 @@ select.btn { padding: 6px 8px; }
 .big .label { color: var(--dim); font-size: 12px; text-transform: uppercase; letter-spacing: .8px; }
 .big .value { font-size: 48px; font-weight: 700; color: var(--accent); line-height: 1.1; margin-top: 4px; }
 .big .meta { font-size: 12px; margin-top: 6px; }
+.big .run-note {
+  font-size: 12px; margin-top: 8px; font-weight: 600; color: var(--warn);
+}
+/* Stopped by the operator: the hero loses its "live" colour so a frozen chart
+   is never read as a current measurement. */
+body.held .big .value { color: var(--dim); }
 .avgsel {
   margin-left: 10px; background: var(--panel2); color: var(--text);
   border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; font-size: 11px;

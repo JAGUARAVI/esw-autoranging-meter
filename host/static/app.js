@@ -45,6 +45,9 @@ const state = {
   lastCurve: null,      // last ADC charge curve (for theme re-render)
   lastSpread: null,     // last spread (for theme re-render)
   lastValid: false,     // last validity (for theme re-render)
+  linkOn: false,        // websocket link state (gates the sample-and-hold tick)
+  runKnown: false,      // has the device reported its autoranging run-state?
+  running: true,        // @@EVT fe run flag (false => stopped, hold charts)
 };
 
 // Parse a capacitance string with an optional unit suffix; plain numbers are pF.
@@ -775,6 +778,34 @@ function updateFe(ev) {
     bd.textContent = "Auto discharge: " + (ev.auto_dis ? "ON" : "OFF");
     bd.classList.toggle("on", !!ev.auto_dis);
   }
+  // Autoranging run-state: when the device is stopped, hold the charts instead
+  // of letting the sample-and-hold tick fake a live flat line.
+  if (ev.run !== undefined) {
+    state.runKnown = true;
+    state.running = !!ev.run;
+    updateRunState();
+  }
+}
+
+// Reflect the run/stop state on the hero so a held chart is never mistaken for
+// a live reading.
+function updateRunState() {
+  const held = state.linkOn && state.runKnown && !state.running;
+  document.body.classList.toggle("held", held);
+  const note = document.getElementById("runNote");
+  if (!note) return;
+  if (held) {
+    note.classList.remove("hidden");
+    note.textContent = "Measurement stopped — charts held at last values";
+  } else {
+    note.classList.add("hidden");
+  }
+}
+// The sample-and-hold flush must only run while data is actually expected.
+function liveTicking() {
+  if (!state.linkOn) return false;                 // disconnected: no live data
+  if (state.runKnown && !state.running) return false; // stopped by the operator
+  return true;
 }
 // No telemetry: the front-end state is unknown, not "safe".
 function markFeStale() {
@@ -858,6 +889,8 @@ function setLink(on, port, err, urls) {
   el.className = "pill " + (on ? "on" : "off");
   document.getElementById("port").textContent = port || "—";
   if (urls && urls.length) state.urls = urls;
+  state.linkOn = on;
+  updateRunState();
 }
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -946,17 +979,22 @@ document.getElementById("btnTare").onclick = () => calCmd("zero");
 document.getElementById("btnTareAll").onclick = () => cmd("zeroall");
 document.getElementById("btnCalTable").onclick = () => cmd("cal?");
 document.getElementById("btnCalClear").onclick = () => calCmd("calclear");
+// OSC references accept unit suffixes (p / n / u / m / f), converted to pF
+// client-side because the firmware's `cal*` commands take a bare pF number.
 document.getElementById("btnCal1p").onclick = () => {
-  const v = document.getElementById("ref1").value;
-  if (v) calCmd("cal " + v);
+  const pf = capToPf(document.getElementById("ref1").value);
+  if (isFinite(pf) && pf > 0) calCmd("cal " + pf);
+  else toast("Enter a reference capacitance (e.g. 100p, 1n, 4.7u)", "warn");
 };
 document.getElementById("btnCalA").onclick = () => {
-  const v = document.getElementById("refA").value;
-  if (v) calCmd("cal1 " + v);
+  const pf = capToPf(document.getElementById("refA").value);
+  if (isFinite(pf) && pf > 0) calCmd("cal1 " + pf);
+  else toast("Enter reference 1 capacitance (e.g. 100p, 1n)", "warn");
 };
 document.getElementById("btnCalB").onclick = () => {
-  const v = document.getElementById("refB").value;
-  if (v) calCmd("cal2 " + v);
+  const pf = capToPf(document.getElementById("refB").value);
+  if (isFinite(pf) && pf > 0) calCmd("cal2 " + pf);
+  else toast("Enter reference 2 capacitance (e.g. 10n, 1u)", "warn");
 };
 
 // ADC (RC-step) series-resistance calibration
@@ -1024,8 +1062,12 @@ function resizeAll() {
 }
 window.addEventListener("resize", resizeAll);
 
-// Flush sample-and-hold once per tick so multi-range lines stay continuous.
+// Flush sample-and-hold once per tick so multi-range lines stay continuous —
+// but only while telemetry is actually expected.  When the device is stopped or
+// the link is down the charts freeze at their last real values instead of
+// crawling forward at a held level (which would imply live data).
 setInterval(() => {
+  if (!liveTicking()) return;
   const x = Date.now() / 1000;
   Object.values(charts).forEach((c) => c.tick(x));
 }, 300);

@@ -114,7 +114,8 @@ the in-flight cycle at the next safe point and then run.
 Commands (type `h`): `start/stop/single`, `precharge`, `discharge`, `idle`,
 `autoprecharge on|off`, `autodischarge on|off`, `auto?`, `auto`, `range <0-3>`,
 `zero`, `zeroall`, `cal <pF>`, `cal1/cal2 <pF>`, `cal?`, `calclear`,
-`probe <0-3>`, `status`, `stream on|off`, `curve on|off`.
+`probe <0-3>`, `status`, `stream on|off`, `curve on|off`,
+`led <r> <g> <b> | auto | off`.
 
 Front-end power is deliberately **not** tied to `start`/`stop`. `start`/`stop`
 only gate autoranging; `precharge`/`discharge`/`idle` drive the SSRs. Toggling
@@ -140,7 +141,13 @@ Telemetry: with `stream on` the firmware prints single-line JSON after a
 `calres`, `adccalpt`, `adccalres`, `fe`, `ack`). `sweep` reports the autoranging
 range/method decision, `fuse` reports the per-sample fusion breakdown (weights,
 median gate and fused value), and `stat` reports device health (uptime, completed
-cycles, last cycle time, free heap). `curve on` adds the full ADC
+cycles, last cycle time, free heap). `cycle` and `fuse` also carry a fused
+`quality` (mean quality of the post-gate population) and a `mismatch_ratio`
+(hi/lo of the ADC vs OSC estimates, `null` if only one method ran) — the trust
+view consumes these directly. `fe` also reports the autoranging run-state
+(`run`/`single`/`lock`, re-emitted on `start`/`stop`/`single`/`auto`/`range`),
+so the precision view can hold — rather than fade as "stale" — when the device is
+intentionally stopped. `curve on` adds the full ADC
 charge curve (the host stores the latest and replays it to reconnecting
 clients). Human `ESP_LOG`
 lines are emitted alongside and are unaffected.
@@ -153,8 +160,43 @@ host/run.sh          # autodetects /dev/ttyACM*; open http://127.0.0.1:8000
 
 It owns the serial port, renders live capacitance/spread/frequency/τ/curve/
 calibration/tare charts (fed only by real telemetry), and exposes the
-calibration commands plus a raw command console and CSV export. See
+calibration commands plus a raw command console and CSV export. A second,
+radical-transparency bench view (hero + trust translation + step timeline, with
+progressively disclosed diagnostics) is served at `/precision`. See
 `host/README.md`.
+
+### Onboard status LED (WS2812)
+
+The Freenove ESP32-S3 WROOM carries a single addressable WS2812 (GRB) on
+**GPIO48**. It is driven from an RMT TX channel using the built-in copy encoder
+(the firmware precomputes the 24 bit-slots + reset as `rmt_symbol_word_t`, so the
+CPU never bit-bangs), and animated by a dedicated low-priority task. The LED is a
+live front-panel indicator for the bench and the demo:
+
+| State | LED |
+| --- | --- |
+| boot | R → G → B flourish, then live |
+| IDLE (all off, safe to touch) | calm blue breathe |
+| PRE-CHARGE | amber pulse |
+| ISOLATE / biased (`FE_PRECHARGED`) | **steady red** — do not touch the DUT |
+| MEASURING | breathes the **active range colour** (100 Ω red, 1 kΩ amber, 100 kΩ blue, 1 MΩ green — same tokens as the dashboard) |
+| DISCHARGE | green pulse |
+| after each cycle | 300 ms flash: green (clean) / amber (low confidence or ADC–OSC mismatch) / red (cycle rejected) |
+| FAULT (reserved) | red blink |
+
+`led auto` restores state animation, `led off` blanks it, and `led <r> <g> <b>`
+holds a fixed colour for a demo. Build-time overrides:
+`-DSTATUS_LED_GPIO=<n>` and `-DSTATUS_LED_ENABLE=0`.
+
+Driver notes (do not regress): the WS2812 frame is 25 RMT symbols, so
+`mem_block_symbols = 64` is used to get 48-symbol ping-pong halves — the frame
+then completes with only the final TX-done event, no mid-frame threshold
+interrupt. The channel is created with `intr_priority = 3` so a fast LM393
+oscillator (edge ISR at up to ~166 kHz) cannot starve RMT completion, and the
+animation task is **non-blocking**: it advances only when the previous frame's
+`on_trans_done` callback has fired (with a 250 ms watchdog), never calling
+`rmt_tx_wait_all_done()`. Blocking on that wait from the LED task caused
+`rmt: rmt_tx_wait_all_done(): flush timeout` spam during oscillator measurements.
 
 ## 6. Pending Action Items & Validation Required
 

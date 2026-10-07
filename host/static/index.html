@@ -20,6 +20,7 @@
     <button class="btn small" id="btnShare" title="Open this dashboard on a phone / tablet">Share</button>
     <button class="btn small" id="btnPresent" title="Hide diagnostics, enlarge the demo view">Present</button>
     <button class="btn small" id="btnTheme" title="Toggle light / dark theme">Light</button>
+    <a class="btn small" href="/precision" title="Radical-transparency precision instrument view">Precision view</a>
     <a class="btn small" href="/api/export.csv">Export CSV</a>
   </div>
 </header>
@@ -53,6 +54,7 @@
     <div id="capValue" class="value mono">—</div>
     <div id="capMeta" class="meta dim">waiting for telemetry…</div>
     <div id="capHistory" class="meta dim"></div>
+    <div id="runNote" class="run-note hidden"></div>
   </div>
 
   <div class="card gauge-card">
@@ -256,17 +258,17 @@
     <hr />
     <div class="calrow">
       <label>One-point ref</label>
-      <input id="ref1" class="mono" type="number" step="any" placeholder="pF" />
+      <input id="ref1" class="mono" type="text" placeholder="e.g. 100p, 1n, 4.7u" />
       <button class="btn" id="btnCal1p">Cal K</button>
     </div>
     <div class="calrow">
       <label>Two-point</label>
-      <input id="refA" class="mono" type="number" step="any" placeholder="ref1 pF" />
+      <input id="refA" class="mono" type="text" placeholder="ref1 e.g. 100p, 1n" />
       <button class="btn" id="btnCalA">Capture 1</button>
     </div>
     <div class="calrow">
       <label>then</label>
-      <input id="refB" class="mono" type="number" step="any" placeholder="ref2 pF" />
+      <input id="refB" class="mono" type="text" placeholder="ref2 e.g. 10n, 1u" />
       <button class="btn" id="btnCalB">Capture 2 (solve)</button>
     </div>
     <div class="hint dim">Tare removes the ~136 pF parasitic node capacitance. Two-point solves K and T0 together.</div>

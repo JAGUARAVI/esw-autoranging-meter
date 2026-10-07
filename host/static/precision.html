@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>ESWCap — Precision Instrument</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='5' fill='%230d1117'/%3E%3Ctext x='16' y='23' font-size='17' font-family='monospace' font-weight='bold' text-anchor='middle' fill='%234ade80'%3EE%3C/text%3E%3C/svg%3E" />
+<link rel="stylesheet" href="/static/vendor/uPlot.min.css" />
+<link rel="stylesheet" href="/static/precision.css" />
+</head>
+<body>
+
+<!-- PERSISTENT FAULT — blocks UI until resolved -->
+<div id="faultBanner" class="fault-banner hidden">
+  <span id="faultText">FAULT</span>
+  <span class="fb-sub" id="faultSub"></span>
+  <button class="fb-action hidden" id="faultAction">Reconnect</button>
+</div>
+
+<header class="topbar">
+  <div class="brand">ESWCap <span class="ver">v1.2</span></div>
+  <div class="conn">
+    <span id="linkDot" class="link-dot"></span>
+    <span id="linkName" class="link-name">connecting…</span>
+    <span id="portName" class="mono dim">—</span>
+  </div>
+  <div class="spacer"></div>
+  <span class="mono dim">Uptime <b id="uptime" class="num">—</b></span>
+  <span id="health" class="chip">HEALTH: ?</span>
+  <div class="acts">
+    <a class="btn" href="/" title="Full debug / presentation dashboard">Settings</a>
+    <a class="btn" href="/api/export.csv">Export CSV</a>
+  </div>
+</header>
+
+<!-- FRONT-END STATE STRIP -->
+<section class="fe-strip">
+  <span id="feState" class="fe-state">IDLE</span>
+  <span id="chipSSR13" class="chip">SSR1+SSR3</span>
+  <span id="chipSSR2" class="chip">SSR2</span>
+  <span id="chipDrive" class="chip">DRIVE</span>
+  <span id="chipAutoPre" class="chip">Auto-Pre: ?</span>
+  <span id="chipAutoDis" class="chip">Auto-Dis: ?</span>
+  <span id="runState" class="chip">RUN: ?</span>
+</section>
+
+<!-- MEASUREMENT / FRONT-END / SESSION CONTROLS -->
+<section class="controls">
+  <div class="grp">
+    <span class="glabel">Measurement</span>
+    <button class="btn" id="btnStart">Start</button>
+    <button class="btn" id="btnStop">Stop</button>
+    <button class="btn" id="btnSingle">Single</button>
+    <select id="mode" class="btn" title="Autorange or lock a range">
+      <option value="-1">Autorange</option>
+      <option value="0">Lock 100 Ω</option>
+      <option value="1">Lock 1 kΩ</option>
+      <option value="2">Lock 100 kΩ</option>
+      <option value="3">Lock 1 MΩ</option>
+    </select>
+  </div>
+  <div class="grp">
+    <span class="glabel">Front-end power</span>
+    <button class="btn danger" id="btnPrecharge" title="Apply bias and clamp V_cap — confirms first">Pre-charge</button>
+    <button class="btn" id="btnDischarge">Discharge</button>
+    <button class="btn ghost" id="btnIdle" title="All SSRs off; bias may be held through R_bias">Idle</button>
+  </div>
+  <div class="grp">
+    <span class="glabel">Automation</span>
+    <button class="btn ghost" id="btnAutoPre">Auto-Pre: ?</button>
+    <button class="btn ghost" id="btnAutoDis">Auto-Dis: ?</button>
+  </div>
+  <div class="grp">
+    <span class="glabel">Streaming</span>
+    <label class="chk"><input type="checkbox" id="curveChk" /> ADC curves</label>
+  </div>
+  <div class="grp">
+    <span class="glabel">Session</span>
+    <button class="btn" id="btnSaveCsv">Save CSV</button>
+    <button class="btn" id="btnSaveJson">Save JSON</button>
+    <button class="btn ghost" id="btnClear" title="Clear all recorded telemetry and reset the view">Clear</button>
+  </div>
+</section>
+
+<!-- ======================= ABOVE THE FOLD ======================= -->
+<section class="fold">
+  <!-- HERO -->
+  <div class="card hero-card" id="heroCard">
+    <div class="hero-head">
+      <span class="hero-label">Fused Capacitance</span>
+      <label class="dim">instant vs rolling avg
+        <select id="avgWindow" class="avgsel" title="Rolling average of the last N valid readings">
+          <option value="1">instant</option>
+          <option value="3">avg 3</option>
+          <option value="5" selected>avg 5</option>
+          <option value="10">avg 10</option>
+          <option value="20">avg 20</option>
+        </select>
+      </label>
+    </div>
+    <div id="heroValue" class="hero-value mono">—</div>
+    <div class="hero-row">
+      <span><span class="k">Avg:</span> <b id="heroAvg" class="num">—</b></span>
+      <span><span class="k">Trend:</span> <b id="heroTrend" class="trend stable">—</b></span>
+      <span id="heroCycle" class="dim"></span>
+    </div>
+    <div id="staleNote" class="stale-note hidden"></div>
+    <div id="reconnectBar" class="reconnect-bar hidden">
+      <button class="btn" id="btnReconnect">Reconnect</button>
+      <span class="dim"> — device link lost, hero value suppressed until telemetry returns.</span>
+    </div>
+  </div>
+
+  <!-- TRUST & PROVENANCE -->
+  <div class="card trust" id="trustCard">
+    <div class="card-title">Trust &amp; Provenance</div>
+    <div id="trustHead" class="trust-head">Waiting for a measurement…</div>
+    <div id="trustBody" class="trust-body"><span class="ln dim">No cycle telemetry yet.</span></div>
+    <div class="trust-grid">
+      <div><div class="k">Active method</div><div class="v" id="activeBadge"><span class="badge">—</span></div></div>
+      <div><div class="k">Median gate</div><div class="v mono" id="gateText">—</div></div>
+      <div><div class="k">Method mismatch</div><div class="v mono" id="mismatchText">—</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= PRIMARY TIMELINE ======================= -->
+<section class="card timeline-card" id="timelineCard">
+  <div class="card-title">
+    Capacitance vs measurement cycle <span class="dim">(log scale, pF)</span>
+    <label class="autopan"><input type="checkbox" id="autoPan" checked /> auto-pan</label>
+    <button class="btn tiny ghost hidden" id="btnLive">● Resume live</button>
+  </div>
+  <div id="capChart" class="plot"></div>
+  <div id="timelineNote" class="dim" style="font-size:12px;margin-top:8px">
+    X-axis = measurement index (idle time collapses). Hover for the absolute timestamp; click a point to pin its telemetry.
+  </div>
+</section>
+
+<!-- ================== SECONDARY: PROGRESSIVELY DISCLOSED ================== -->
+<details class="card coll" id="panelFusion">
+  <summary>Fusion breakdown &amp; samples</summary>
+  <div class="panel-body">
+    <div class="sub-title">Fusion weights <span class="dim" style="text-transform:none;letter-spacing:0">— bar width ∝ quality weight</span></div>
+    <div id="fusionWeights" class="dim">no fusion data yet</div>
+    <div class="sub-title" style="margin-top:18px">Sample spread <span class="dim" style="text-transform:none;letter-spacing:0">— centred on the median (0%); red = rejected by the ±87.5% gate</span></div>
+    <div id="spreadPlot" class="spread-plot dim">no samples yet</div>
+    <div class="sub-title" style="margin-top:18px">Contributing samples</div>
+    <div class="tablewrap">
+      <table id="sampleTable">
+        <thead><tr><th>Range</th><th>Method</th><th>Status</th><th>C</th><th>q</th><th>w</th><th>T / τ</th><th>f / R²</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+</details>
+
+<details class="card coll" id="panelCurve">
+  <summary>ADC charge curve &amp; fit <span class="dim" style="text-transform:none;letter-spacing:0">— bucketed per resistance</span></summary>
+  <div class="panel-body">
+    <div id="curveTabs" class="tabs"></div>
+    <div id="curveChart" class="plot" style="height:260px"></div>
+    <div id="curveMeta" class="dim" style="font-size:12px;margin-top:8px">waiting for an ADC curve…</div>
+  </div>
+</details>
+
+<!-- ================== TERTIARY: SYSTEM ================== -->
+<details class="card coll" id="panelCal">
+  <summary>Calibration &amp; tare</summary>
+  <div class="panel-body">
+    <div class="sub-title">Per-range state <span class="dim" style="text-transform:none;letter-spacing:0">— K, T0, validity (the ~136 pF parasitic node is absorbed into T0, not hidden)</span></div>
+    <div id="calGrid" class="cal-grid"><div class="dim">waiting for device boot…</div></div>
+    <div class="cal-actions">
+      <label class="dim">Target range
+        <select id="calRange" class="avgsel">
+          <option value="0">100 Ω</option>
+          <option value="1">1 kΩ</option>
+          <option value="2" selected>100 kΩ</option>
+          <option value="3">1 MΩ</option>
+        </select>
+      </label>
+      <button class="btn" id="btnTare" title="Tare T0 with the socket empty (oscillator)">Tare (empty)</button>
+      <button class="btn" id="btnTareAll" title="Tares the 100 kΩ and 1 MΩ oscillator ranges">Tare all (100k/1M)</button>
+      <input id="refK" class="num" type="text" placeholder="ref e.g. 100p, 1n, 4.7u" />
+      <button class="btn" id="btnCalK">Cal K</button>
+      <input id="adcRef" class="num" type="text" placeholder="ref e.g. 10u" />
+      <button class="btn" id="btnAdcCal">Cal R_eff</button>
+      <button class="btn ghost" id="btnCalRefresh">Show cal</button>
+    </div>
+    <div id="calNotes" class="cal-notes">
+      Tare removes the fixed parasitic capacitance. Two-point <code>cal1/cal2</code> solves K and T0 together;
+      <code>adccal1/adccal2</code> solve the ADC series resistance. <b>100 Ω and 1 kΩ are intentionally
+      untared</b> — T0 is negligible for the large capacitors those ranges serve, so a missing tare there
+      is not a fault. Commands are also available in the console below.
+    </div>
+    <pre id="calTable" class="log" style="height:auto;max-height:200px;margin-top:12px"></pre>
+  </div>
+</details>
+
+<details class="card coll" id="panelConsole">
+  <summary>Console &amp; raw telemetry</summary>
+  <div class="panel-body">
+    <div class="console">
+      <input id="cmdInput" class="mono" placeholder="type a firmware command (h for help)…" autocomplete="off" />
+      <button class="btn" id="btnSend">Send</button>
+    </div>
+    <pre id="log" class="log"></pre>
+  </div>
+</details>
+
+<div id="toasts" class="toasts"></div>
+
+<script src="/static/vendor/uPlot.iife.min.js"></script>
+<script src="/static/precision.js"></script>
+</body>
+</html>

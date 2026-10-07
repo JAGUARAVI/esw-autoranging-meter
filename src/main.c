@@ -27,12 +27,15 @@
 
 #include "driver/gpio.h"
 #include "driver/pulse_cnt.h"
+#include "driver/rmt_encoder.h"
+#include "driver/rmt_tx.h"
 #include "driver/uart.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
+#include "esp_attr.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
@@ -110,8 +113,8 @@ static inline int64_t atomic_read_i64(volatile int64_t *p)
 #define PROBE_MIN_VALID_US 200 // probe on a "slow" range trusts τ ≥ this
 #define MAX_SAMPLES 12         // 4 ADC + probe + best OSC + alt OSC + headroom
 
-#define PRECHARGE_HOLD_MS 1000
-#define DISCHARGE_HOLD_MS 1000
+#define PRECHARGE_HOLD_MS 2000
+#define DISCHARGE_HOLD_MS 2000
 #define ISOLATION_DELAY_US 2000
 #define ADC_TIMEOUT_FAST_US 5000000LL    // 5 s for high-resistance ranges
 #define ADC_TIMEOUT_SLOW_US 15000000LL   // 15 s for the 100 Ω / 1 kΩ ranges
@@ -208,6 +211,8 @@ typedef struct {
     double adc_estimate;    // fused ADC-only value (NAN if none)
     double osc_estimate;    // fused OSC-only value (NAN if none)
     bool method_mismatch;   // ADC and OSC disagree beyond uncertainty
+    double method_mismatch_ratio; // hi/lo of the per-method estimates (NAN if one method)
+    double quality;         // fused quality: mean quality of the post-gate population
     int raw_samples;        // total valid samples collected
     // --- fusion-breakdown telemetry (for the dashboard) ---
     double median_f;        // median of the pre-gate population (F), 0 if none
@@ -771,6 +776,240 @@ static void front_end_finish(void)
     fe_set(FE_IDLE);
 }
 
+// ---------------------------------------------------------------------------
+// Onboard status LED
+// ---------------------------------------------------------------------------
+// The Freenove ESP32-S3 WROOM carries a single addressable WS2812 (GRB) on
+// GPIO48.  It is driven from an RMT TX channel using the built-in copy encoder:
+// we precompute the 24 bit-slots + reset as rmt_symbol_word_t and let the
+// peripheral clock them out, so the CPU never bit-bangs.  A small task owns the
+// animation; the measurement/console code only updates the mode.
+#ifndef STATUS_LED_GPIO
+#define STATUS_LED_GPIO 48
+#endif
+#ifndef STATUS_LED_ENABLE
+#define STATUS_LED_ENABLE 1
+#endif
+
+#define LED_RMT_RES_HZ  10000000   // 10 MHz -> 0.1 us per RMT tick
+#define LED_T0H 3                  // 0.3 us high
+#define LED_T0L 9                  // 0.9 us low
+#define LED_T1H 9                  // 0.9 us high
+#define LED_T1L 3                  // 0.3 us low
+#define LED_RESET_TICKS 600        // 60 us low: latch / reset
+
+typedef enum {
+    LED_MODE_OFF = 0,
+    LED_MODE_IDLE,       // all off / safe to touch              -> calm blue breathe
+    LED_MODE_PRECHARGE,  // charging C_block/N_DUT               -> amber pulse
+    LED_MODE_BIASED,     // isolated, N_DUT still biased         -> steady red
+    LED_MODE_MEASURING,  // autoranging (colour = active range)  -> range token breathe
+    LED_MODE_DISCHARGE,  // bleeding to GND                      -> green pulse
+    LED_MODE_FAULT,      // reserved for a hard fault            -> red blink
+} led_mode_t;
+
+static rmt_channel_handle_t s_led_chan = NULL;
+static rmt_encoder_handle_t s_led_encoder = NULL;
+static volatile bool       s_led_ready = false;
+static volatile bool       s_led_auto = true;
+static volatile led_mode_t s_led_mode = LED_MODE_IDLE;
+static volatile int        s_led_range = -1;
+static volatile uint8_t    s_led_man_r = 0, s_led_man_g = 0, s_led_man_b = 0;
+static volatile int        s_led_flash = -1;          // -1 none, 0 good, 1 warn, 2 bad
+static volatile int64_t    s_led_flash_until_us = 0;
+static volatile bool       s_led_tx_done = true;      // previous frame finished
+static volatile int64_t    s_led_tx_start_us = 0;
+
+// RMT TX-done callback (IRAM).  We deliberately do NOT block on
+// rmt_tx_wait_all_done(): during an oscillator measurement the LM393 edge ISR
+// runs at up to ~166 kHz and can delay the RMT ISR, which made the blocking wait
+// time out and spam the console.  Instead the task only starts a new frame when
+// the previous one has completed, and holds the last colour otherwise.
+static bool IRAM_ATTR led_tx_done_cb(rmt_channel_handle_t ch,
+                                     const rmt_tx_done_event_data_t *edata, void *user_ctx)
+{
+    (void)ch; (void)edata; (void)user_ctx;
+    s_led_tx_done = true;
+    return false;
+}
+
+static void led_send(uint8_t r, uint8_t g, uint8_t b)
+{
+    if (!s_led_ready) return;
+    if (!s_led_tx_done) {
+        // Still in flight.  If it has been stuck for >250 ms (e.g. the done IRQ
+        // was lost during a long ISR storm), force a retry rather than freeze.
+        if (esp_timer_get_time() - s_led_tx_start_us < 250000) return;
+        s_led_tx_done = true;
+    }
+    rmt_symbol_word_t sym[25];
+    uint32_t grb = ((uint32_t)g << 16) | ((uint32_t)r << 8) | (uint32_t)b;  // WS2812 GRB
+    for (int i = 0; i < 24; ++i) {
+        int bit = (grb >> (23 - i)) & 1;
+        sym[i].level0 = 1;
+        sym[i].duration0 = bit ? LED_T1H : LED_T0H;
+        sym[i].level1 = 0;
+        sym[i].duration1 = bit ? LED_T1L : LED_T0L;
+    }
+    sym[24].level0 = 0; sym[24].duration0 = LED_RESET_TICKS;
+    sym[24].level1 = 0; sym[24].duration1 = 0;
+    rmt_transmit_config_t tx = { .loop_count = 0 };
+    s_led_tx_start_us = esp_timer_get_time();
+    if (rmt_transmit(s_led_chan, s_led_encoder, sym, sizeof(sym), &tx) == ESP_OK) {
+        s_led_tx_done = false;
+    }
+}
+
+// Range colour tokens, deliberately matching the dashboard palette so the LED
+// and the on-screen "active range" agree.
+static void led_range_rgb(int r, uint8_t *rgb)
+{
+    switch (r) {
+        case 0: rgb[0] = 200; rgb[1] = 60;  rgb[2] = 60;  break;  // 100 Ω  red
+        case 1: rgb[0] = 210; rgb[1] = 150; rgb[2] = 40;  break;  // 1 kΩ  amber
+        case 2: rgb[0] = 70;  rgb[1] = 130; rgb[2] = 220; break;  // 100 kΩ blue
+        case 3: rgb[0] = 70;  rgb[1] = 200; rgb[2] = 120; break;  // 1 MΩ  green
+        default: rgb[0] = 60; rgb[1] = 100; rgb[2] = 170; break;
+    }
+}
+
+static void led_mode_rgb(led_mode_t m, int range, uint8_t *rgb)
+{
+    switch (m) {
+        case LED_MODE_IDLE:      rgb[0] = 0;   rgb[1] = 40;  rgb[2] = 140; break;
+        case LED_MODE_PRECHARGE: rgb[0] = 200; rgb[1] = 120; rgb[2] = 0;   break;
+        case LED_MODE_BIASED:    rgb[0] = 180; rgb[1] = 0;   rgb[2] = 0;   break;
+        case LED_MODE_MEASURING: led_range_rgb(range, rgb);                 break;
+        case LED_MODE_DISCHARGE: rgb[0] = 0;   rgb[1] = 160; rgb[2] = 40;  break;
+        case LED_MODE_FAULT:     rgb[0] = 220; rgb[1] = 0;   rgb[2] = 0;   break;
+        default:                 rgb[0] = 0;   rgb[1] = 0;   rgb[2] = 0;   break;
+    }
+}
+
+static void status_led_task(void *arg)
+{
+    (void)arg;
+    // Boot flourish: R -> G -> B, then hand over to the live state machine.
+    if (s_led_ready) {
+        led_send(180, 0, 0);   vTaskDelay(pdMS_TO_TICKS(140));
+        led_send(0, 180, 0);   vTaskDelay(pdMS_TO_TICKS(140));
+        led_send(0, 0, 180);   vTaskDelay(pdMS_TO_TICKS(140));
+        led_send(0, 0, 0);     vTaskDelay(pdMS_TO_TICKS(140));
+    }
+    for (;;) {
+        if (!s_led_auto) {                       // manual override (console 'led')
+            led_send(s_led_man_r, s_led_man_g, s_led_man_b);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        int64_t now = esp_timer_get_time();
+
+        // A short result flash overrides the background state.
+        if (s_led_flash >= 0) {
+            if (now < s_led_flash_until_us) {
+                if (s_led_flash == 0)      led_send(0, 200, 60);       // good  green
+                else if (s_led_flash == 1) led_send(220, 150, 0);      // warn  amber
+                else                       led_send(220, 40, 40);      // bad   red
+                vTaskDelay(pdMS_TO_TICKS(30));
+                continue;
+            }
+            s_led_flash = -1;
+        }
+
+        // Breathing envelope, ~1.6 s period.
+        double phase = (double)(now % 1600000) / 1600000.0;
+        double breathe = phase < 0.5 ? phase * 2.0 : (1.0 - phase) * 2.0;
+
+        uint8_t rgb[3];
+        led_mode_rgb(s_led_mode, s_led_range, rgb);
+        double scale;
+        if (s_led_mode == LED_MODE_BIASED) {
+            scale = 0.85;                                   // steady: "do not touch"
+        } else if (s_led_mode == LED_MODE_FAULT) {
+            scale = (phase < 0.5) ? 1.0 : 0.0;              // blink
+        } else {
+            scale = 0.22 + 0.78 * breathe;                  // calm breathing
+        }
+        led_send((uint8_t)(rgb[0] * scale), (uint8_t)(rgb[1] * scale), (uint8_t)(rgb[2] * scale));
+        vTaskDelay(pdMS_TO_TICKS(25));
+    }
+}
+
+static void status_led_init(void)
+{
+#if !STATUS_LED_ENABLE
+    return;
+#else
+    rmt_tx_channel_config_t tx_cfg = {
+        .gpio_num = (gpio_num_t)STATUS_LED_GPIO,
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = LED_RMT_RES_HZ,
+        // 64 symbols -> 2 HW blocks -> 48-symbol ping-pong halves, so a 25-symbol
+        // WS2812 frame fits in a single half and needs no mid-frame threshold
+        // interrupt to complete (only the final TX-done event).
+        .mem_block_symbols = 64,
+        .trans_queue_depth = 2,
+        // Higher (low/medium) interrupt priority than the LM393 GPIO edge ISR,
+        // so a fast oscillator cannot starve RMT completion.
+        .intr_priority = 3,
+    };
+    if (rmt_new_tx_channel(&tx_cfg, &s_led_chan) != ESP_OK) {
+        ESP_LOGW(TAG, "status LED: RMT channel init failed (LED disabled)");
+        return;
+    }
+    rmt_tx_event_callbacks_t cbs = { .on_trans_done = led_tx_done_cb };
+    rmt_tx_register_event_callbacks(s_led_chan, &cbs, NULL);
+    rmt_copy_encoder_config_t enc_cfg;   // empty on this IDF (no config fields)
+    if (rmt_new_copy_encoder(&enc_cfg, &s_led_encoder) != ESP_OK) {
+        ESP_LOGW(TAG, "status LED: encoder init failed (LED disabled)");
+        return;
+    }
+    if (rmt_enable(s_led_chan) != ESP_OK) {
+        ESP_LOGW(TAG, "status LED: RMT enable failed (LED disabled)");
+        return;
+    }
+    s_led_ready = true;
+    xTaskCreate(status_led_task, "status_led", 3072, NULL, 2, NULL);
+    ESP_LOGI(TAG, "status LED ready (WS2812 on GPIO%d)", STATUS_LED_GPIO);
+#endif
+}
+
+// ---- setters used by the measurement / console code -----------------------
+static void status_led_set_fe(fe_state_t s)
+{
+    switch (s) {
+        case FE_IDLE:       s_led_mode = LED_MODE_IDLE;      break;
+        case FE_PRECHARGE:  s_led_mode = LED_MODE_PRECHARGE; break;
+        case FE_PRECHARGED: s_led_mode = LED_MODE_BIASED;    break;
+        case FE_MEASURING:  s_led_mode = LED_MODE_MEASURING; break;
+        case FE_DISCHARGE:  s_led_mode = LED_MODE_DISCHARGE; break;
+    }
+}
+// Flash the fusion result: green (clean) / amber (warn) / red (rejected), and
+// adopt the dominant contributing range as the next colour token.
+static void status_led_report_result(const fusion_t *f)
+{
+    if (f->valid) {
+        int r = -1;
+        double best = -1.0;
+        for (int i = 0; i < g_fusion_n_contrib; ++i) {
+            const fusion_contrib_t *c = &g_fusion_contrib[i];
+            if (c->kept && c->w > best) { best = c->w; r = c->range_idx; }
+        }
+        if (r >= 0) s_led_range = r;
+        bool warn = (f->rel_spread > 0.05) || (f->quality < 0.02) || f->method_mismatch;
+        s_led_flash = warn ? 1 : 0;
+    } else {
+        s_led_flash = 2;
+    }
+    s_led_flash_until_us = esp_timer_get_time() + 300000;  // 300 ms
+}
+static void status_led_set_auto(void) { s_led_auto = true; }
+static void status_led_manual(uint8_t r, uint8_t g, uint8_t b)
+{
+    s_led_man_r = r; s_led_man_g = g; s_led_man_b = b; s_led_auto = false;
+}
+
 static void system_hw_init(void)
 {
     gpio_config_t output_config = {
@@ -851,6 +1090,8 @@ static void system_hw_init(void)
     adc_cali_ready = false;
     ESP_LOGW(TAG, "ADC calibration scheme not supported by this build");
 #endif
+
+    status_led_init();
 }
 
 // Recover the true DUT capacitance from the measured series-equivalent.
@@ -922,14 +1163,17 @@ static void evt_boot(void)
 static void evt_cycle(const fusion_t *f)
 {
     if (!g_stream) return;
-    char adc[32], osc[32];
+    char adc[32], osc[32], mr[32];
     json_num(adc, sizeof(adc), f->adc_estimate);
     json_num(osc, sizeof(osc), f->osc_estimate);
+    json_num(mr, sizeof(mr), f->method_mismatch_ratio);
     printf("@@EVT {\"t\":\"cycle\",\"ts_ms\":%lld,\"valid\":%s,\"c\":%.9g,"
-           "\"spread\":%.6g,\"weight\":%.6g,\"n_adc\":%d,\"n_osc\":%d,\"raw\":%d,"
+           "\"spread\":%.6g,\"quality\":%.6g,\"weight\":%.6g,\"mismatch_ratio\":%s,"
+           "\"n_adc\":%d,\"n_osc\":%d,\"raw\":%d,"
            "\"adc\":%s,\"osc\":%s,\"mismatch\":%s}\n",
            (long long)(esp_timer_get_time() / 1000), f->valid ? "true" : "false",
-           f->capacitance_f, f->rel_spread, f->total_weight, f->n_adc, f->n_osc,
+           f->capacitance_f, f->rel_spread, f->quality, f->total_weight, mr,
+           f->n_adc, f->n_osc,
            f->raw_samples, adc, osc, f->method_mismatch ? "true" : "false");
 }
 
@@ -955,11 +1199,15 @@ static void evt_sample(const sample_t *s)
 static void evt_fuse(const fusion_t *f)
 {
     if (!g_stream) return;
+    char mr[32];
+    json_num(mr, sizeof(mr), f->method_mismatch_ratio);
     printf("@@EVT {\"t\":\"fuse\",\"valid\":%s,\"median\":%.9g,\"c\":%.9g,"
-           "\"c_min\":%.9g,\"c_max\":%.9g,\"spread\":%.6g,\"gate_rel\":%.4g,"
+           "\"c_min\":%.9g,\"c_max\":%.9g,\"spread\":%.6g,\"quality\":%.6g,"
+           "\"mismatch_ratio\":%s,\"gate_rel\":%.4g,"
            "\"n_kept\":%d,\"n_gated\":%d,\"w_total\":%.6g,\"contrib\":[",
            f->valid ? "true" : "false", f->median_f, f->capacitance_f,
-           f->c_min_f, f->c_max_f, f->rel_spread, (double)FUSION_GATE_REL,
+           f->c_min_f, f->c_max_f, f->rel_spread, f->quality, mr,
+           (double)FUSION_GATE_REL,
            f->n_kept, f->n_gated, f->total_weight);
     for (int i = 0; i < g_fusion_n_contrib; ++i) {
         const fusion_contrib_t *c = &g_fusion_contrib[i];
@@ -1082,7 +1330,8 @@ static void evt_fe(void)
     if (!g_stream) return;
     printf("@@EVT {\"t\":\"fe\",\"state\":\"%s\",\"ssr13\":%d,\"ssr2\":%d,\"drive\":%d,"
            "\"biased\":%s,\"charged\":%s,\"discharged\":%s,"
-           "\"auto_pre\":%s,\"auto_dis\":%s}\n",
+           "\"auto_pre\":%s,\"auto_dis\":%s,"
+           "\"run\":%s,\"single\":%s,\"lock\":%d}\n",
            fe_name(g_fe_state),
            gpio_get_level(SSR_S1_S3_PIN), gpio_get_level(SSR_S2_PIN),
            gpio_get_level(DRIVE_PIN),
@@ -1090,7 +1339,10 @@ static void evt_fe(void)
            g_fe_charged ? "true" : "false",
            g_fe_discharged ? "true" : "false",
            g_auto_precharge ? "true" : "false",
-           g_auto_discharge ? "true" : "false");
+           g_auto_discharge ? "true" : "false",
+           g_run ? "true" : "false",
+           g_single_shot ? "true" : "false",
+           g_range_lock);   // lock is configuration; persists across stop
 }
 
 // Change state and announce it (no-op if unchanged).
@@ -1098,6 +1350,7 @@ static void fe_set(fe_state_t s)
 {
     if (g_fe_state == s) return;
     g_fe_state = s;
+    status_led_set_fe(s);
     evt_fe();
 }
 
@@ -1769,6 +2022,7 @@ static fusion_t fuse_samples(const sample_t *samples, int n)
         .valid = false, .capacitance_f = 0.0, .rel_spread = 0.0,
         .total_weight = 0.0, .n_adc = 0, .n_osc = 0,
         .adc_estimate = NAN, .osc_estimate = NAN, .method_mismatch = false,
+        .method_mismatch_ratio = NAN, .quality = 0.0,
         .raw_samples = n,
         .median_f = 0.0, .n_kept = 0, .n_gated = 0,
         .c_min_f = 0.0, .c_max_f = 0.0,
@@ -1821,7 +2075,10 @@ static fusion_t fuse_samples(const sample_t *samples, int n)
     if (!isnan(f.adc_estimate) && !isnan(f.osc_estimate)) {
         double lo = fmin(f.adc_estimate, f.osc_estimate);
         double hi = fmax(f.adc_estimate, f.osc_estimate);
-        if (lo > 0.0 && hi / lo > METHOD_MISMATCH_RATIO) f.method_mismatch = true;
+        if (lo > 0.0) {
+            f.method_mismatch_ratio = hi / lo;
+            if (f.method_mismatch_ratio > METHOD_MISMATCH_RATIO) f.method_mismatch = true;
+        }
     }
 
     double med = median_of(cvals, n_kept);
@@ -1861,6 +2118,10 @@ static fusion_t fuse_samples(const sample_t *samples, int n)
     double fused_log = lw_sum / lw;
     f.capacitance_f = exp(fused_log);
     f.total_weight = lw;
+    // Fused quality: weight-weighted mean quality of the post-gate population.
+    // lw is Σ quality_i over the kept samples, so lw / n_kept is their mean.
+    int n_kept_gate = n_adc_kept + n_osc_kept;
+    if (n_kept_gate > 0) f.quality = lw / (double)n_kept_gate;
     f.valid = true;
 
     // Weighted relative spread (RMS log deviation → fractional).
@@ -2604,7 +2865,8 @@ static void console_help(void)
            "  adccalclear [0-3]    reset ADC calibration (current range or given)\n"
            "  probe <0-3>          connectivity/charge probe of a range\n"
            "  stream on|off        emit @@EVT JSON telemetry\n"
-           "  curve on|off         include full ADC charge curves in telemetry\n");
+           "  curve on|off         include full ADC charge curves in telemetry\n"
+           "  led auto|off|<r> <g> <b>  onboard WS2812 status LED\n");
 }
 
 // Parse an on/off/1/0 argument.  Returns 1, 0, or -1 if unrecognised.
@@ -2681,12 +2943,40 @@ static bool console_handle_hw(const char *line)
                evt_fe(); evt_ack("autoprecharge", 1, v ? "on" : "off"); }
         return true;
     }
-    if (!strncmp(line, "autodischarge", 12)) {
-        int v = parse_onoff(line + 12);
+    // NOTE: "autodischarge" is 13 chars — the argument starts at offset 13, not 12
+    // (offset 12 lands on the trailing 'e', which parse_onoff then rejects).
+    if (!strncmp(line, "autodischarge", 13)) {
+        int v = parse_onoff(line + 13);
         if (v < 0) { printf(">> usage: autodischarge on|off\n"); }
         else { g_auto_discharge = v;
                printf(">> auto-discharge %s\n", v ? "ON" : "OFF");
                evt_fe(); evt_ack("autodischarge", 1, v ? "on" : "off"); }
+        return true;
+    }
+    // Onboard status LED: 'led auto' returns to state animation, 'led off' blanks
+// it, 'led r g b' drives a fixed colour (handy for a bench demo).
+    if (!strncmp(line, "led", 3)) {
+        const char *arg = line + 3;
+        while (*arg == ' ') ++arg;
+        if (!strncmp(arg, "auto", 4)) {
+            status_led_set_auto();
+            printf(">> LED auto (status indicator)\n");
+            evt_ack("led", 1, "auto");
+        } else if (!strncmp(arg, "off", 3)) {
+            status_led_manual(0, 0, 0);
+            printf(">> LED off\n");
+            evt_ack("led", 1, "off");
+        } else {
+            int r, g, b;
+            if (sscanf(arg, "%d %d %d", &r, &g, &b) == 3 &&
+                r >= 0 && r <= 255 && g >= 0 && g <= 255 && b >= 0 && b <= 255) {
+                status_led_manual((uint8_t)r, (uint8_t)g, (uint8_t)b);
+                printf(">> LED manual r=%d g=%d b=%d\n", r, g, b);
+                evt_ack("led", 1, "manual");
+            } else {
+                printf(">> usage: led <r> <g> <b> | led auto | led off\n");
+            }
+        }
         return true;
     }
     if (!strcmp(line, "auto?")) {
@@ -2840,6 +3130,7 @@ static void console_dispatch(const char *line)
 // in-flight cycle so the transition is prompt.
     if (!strcmp(line, "start")) { g_run = true; g_single_shot = false;
                                   invalidate_vinf_cache();   // fresh session
+                                  evt_fe();                  // run-state for the UI
                                   evt_ack("start", 1, "autoranging"); return; }
     if (!strcmp(line, "stop"))  { g_run = false;
                                   if (g_measuring) {
@@ -2851,13 +3142,16 @@ static void console_dispatch(const char *line)
                                   } else {
                                       front_end_finish();
                                   }
+                                  evt_fe();                  // run-state for the UI
                                   evt_ack("stop", 1, g_auto_discharge
                                           ? "stopped; auto-discharged"
                                           : "stopped; isolated (bias held)"); return; }
     if (!strcmp(line, "single")){ g_single_shot = true; g_run = true;
                                   invalidate_vinf_cache();   // fresh session
+                                  evt_fe();                  // run-state for the UI
                                   evt_ack("single", 1, "one cycle"); return; }
-    if (!strcmp(line, "auto"))  { g_range_lock = -1; evt_ack("auto", 1, "autorange"); return; }
+    if (!strcmp(line, "auto"))  { g_range_lock = -1; evt_fe();
+                                  evt_ack("auto", 1, "autorange"); return; }
     if (!strncmp(line, "range", 5)) {
         int rr = g_console_range;
         for (int i = 5; line[i]; ++i)
@@ -2866,6 +3160,7 @@ static void console_dispatch(const char *line)
         g_console_range = (uint8_t)rr;
         select_mux_channel(RANGES[rr].mux_channel);
         printf(">> range locked to %s\n", RANGES[rr].label);
+        evt_fe();
         evt_ack("range", 1, RANGES[rr].label);
         return;
     }
@@ -3044,7 +3339,7 @@ void app_main(void)
     printf("\n=== CAP METER (normal mode) ===\n"
            "Boots IDLE. Type 'h' for commands: start/stop/single, "
            "precharge/discharge/idle, range/auto, zero/zeroall, cal/cal1/cal2, "
-           "adccal/adccal1/adccal2, probe, stream/curve.\n"
+           "adccal/adccal1/adccal2, probe, stream/curve, led <r> <g> <b>|auto|off.\n"
            "Enable machine telemetry with 'stream on' (append 'curve on' for ADC curves).\n\n");
 
     // A full measurement cycle can take tens of seconds (large DUTs on the
@@ -3113,12 +3408,13 @@ void app_main(void)
         }
 
         log_result(&result);
+        status_led_report_result(&result);   // green/amber/red result flash
         evt_cycle(&result);
         evt_fuse(&result);
         evt_stat();
 
         if (g_single_shot) { g_single_shot = false; g_run = false;
-                             front_end_finish(); }
+                             front_end_finish(); evt_fe(); }
 
         safe_delay_ms(1000);
     }

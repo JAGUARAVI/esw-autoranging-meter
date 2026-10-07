@@ -132,8 +132,10 @@ class Hub:
         for kind in ("sweep", "fuse", "stat", "fe", "calres", "adccalres"):
             if self.latest.get(kind):
                 await ws.send_json({"type": "event", "event": self.latest[kind]})
-        if self.latest["curve"]:
-            await ws.send_json({"type": "event", "event": self.latest["curve"]})
+        # Recent ADC charge curves (one bucket per range) so a late/reconnecting
+        # client can populate its per-resistance view, not just the newest one.
+        for ev in list(HIST["curve"])[-8:]:
+            await ws.send_json({"type": "event", "event": ev})
         for line in list(self.log_lines)[-200:]:
             await ws.send_json({"type": "log", "line": line})
 
@@ -276,6 +278,11 @@ def make_app(hub: Hub) -> FastAPI:
     async def index():
         return FileResponse(STATIC_DIR / "index.html")
 
+    @app.get("/precision")
+    async def precision():
+        """Alternate 'precision instrument' view (radical-transparency layout)."""
+        return FileResponse(STATIC_DIR / "precision.html")
+
     @app.get("/api/state")
     async def state():
         return JSONResponse({
@@ -283,6 +290,17 @@ def make_app(hub: Hub) -> FastAPI:
             "latest": hub.latest,
             "counts": {k: len(v) for k, v in HIST.items()},
         })
+
+    @app.post("/api/clear")
+    async def clear_history():
+        """Drop all recorded telemetry (charts, exports) and tell every client
+        to reset its local view.  The device is NOT touched."""
+        for dq in HIST.values():
+            dq.clear()
+        for k in hub.latest:
+            hub.latest[k] = None
+        await hub.broadcast({"type": "reset"})
+        return JSONResponse({"ok": True})
 
     @app.get("/api/summary")
     async def summary():
@@ -319,10 +337,12 @@ def make_app(hub: Hub) -> FastAPI:
 
         w.writerow(["# cycles"])
         w.writerow(["rx_unix_s", "device_ts_ms", "valid", "c_F", "spread",
-                    "weight", "n_adc", "n_osc", "raw", "adc_F", "osc_F", "mismatch"])
+                    "quality", "weight", "mismatch_ratio", "n_adc", "n_osc",
+                    "raw", "adc_F", "osc_F", "mismatch"])
         for ev in HIST["cycle"]:
             w.writerow([f"{ev.get('rx_unix_s', 0.0):.3f}", ev.get("ts_ms"), ev.get("valid"),
-                        ev.get("c"), ev.get("spread"), ev.get("weight"),
+                        ev.get("c"), ev.get("spread"), ev.get("quality"),
+                        ev.get("weight"), ev.get("mismatch_ratio"),
                         ev.get("n_adc"), ev.get("n_osc"), ev.get("raw"),
                         ev.get("adc"), ev.get("osc"), ev.get("mismatch")])
 
@@ -359,10 +379,11 @@ def make_app(hub: Hub) -> FastAPI:
         w.writerow([])
         w.writerow(["# fusion breakdown"])
         w.writerow(["rx_unix_s", "median_F", "fused_F", "c_min_F", "c_max_F",
-                    "spread", "n_kept", "n_gated", "w_total"])
+                    "spread", "quality", "mismatch_ratio", "n_kept", "n_gated", "w_total"])
         for ev in HIST["fuse"]:
             w.writerow([f"{ev.get('rx_unix_s', 0.0):.3f}", ev.get("median"), ev.get("c"),
                         ev.get("c_min"), ev.get("c_max"), ev.get("spread"),
+                        ev.get("quality"), ev.get("mismatch_ratio"),
                         ev.get("n_kept"), ev.get("n_gated"), ev.get("w_total")])
 
         w.writerow([])
