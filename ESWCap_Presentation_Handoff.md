@@ -162,7 +162,7 @@
 **Blocking-capacitor correction (series combination):**
 - Forward: `C_eq = (C_block · C_dut) / (C_block + C_dut)`.
 - Inversion: `C_dut = (C_eq · C_block) / (C_block − C_eq)`.
-- Applied only above `C_BLOCK_CORRECT_MIN_F = 1 µF`; rejected at/above `0.9 · C_block`.
+- Applied unconditionally (no minimum-capacitance gate): the forward transform is used by every calibration solver, so the inversion must be its exact algebraic inverse; rejected at/above `0.9 · C_block`.
 - Correct recovery order: invert the `C_block` series combo **first**, then subtract parallel stray C.
 
 ### 2.6 Autoranging logic
@@ -309,7 +309,7 @@ PASS/FAIL test methodology, reference component list used for validation, and er
 | Oscillator implementation | ESP32 ISR closes the loop | True free-running hardware | LM393 here is a comparator; loop needed |
 | Calibration model | Per-range `{K, T0}` | Global constants | K drifts per range (latency, hysteresis, resistor tolerance) |
 | Sample combination | Median gate + log-domain weighted average | Simple mean | Robust to glitches, appropriate for multiplicative quantities |
-| Large-cap correction | Series `C_block` inversion above 1 µF | Ignore | Prevents underestimate approaching `C_block` |
+| Large-cap correction | Series `C_block` inversion (applied unconditionally) | Ignore | Prevents underestimate approaching `C_block` |
 | Calibration persistence | NVS | RAM-only | Survives reboot |
 | Front-end safety | SSR state machine + shared SSR1/SSR3 pin | Software-only sequencing | Hardware interlock |
 | Oscillator range restriction | ≥ 100 kΩ only | All ranges | ISR saturation on fast ranges |

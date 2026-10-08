@@ -128,7 +128,6 @@ static inline int64_t atomic_read_i64(volatile int64_t *p)
 #define C_BLOCK_ELEC_F 936.0e-6   // measured electrolytic (nominal 1000 uF)
 #define C_BLOCK_HF_F   67.8e-9    // measured HF bypass     (nominal 100 nF)
 #define C_BLOCK_F      (C_BLOCK_ELEC_F + C_BLOCK_HF_F)
-#define C_BLOCK_CORRECT_MIN_F 1.0e-6  // only worth applying above ~1 uF
 
 // "RES bank" — the four range resistors, in RANGES[] index order (measured).
 #define RES_100_OHM   98.9        // nominal 100 Ω
@@ -606,7 +605,11 @@ static double osc_cal_solve_k(uint8_t range_idx, double freq_hz, double ref_c_f)
     double period_us = 1e6 / freq_hz;
     double eff = period_us - (use_t0 ? osc_t0(range_idx) : osc_delay(range_idx));
     if (c_eq <= 0.0 || eff <= 0.0) return -1.0;
-    return (eff * 1e-6) / (RANGES[range_idx].resistance_ohms * c_eq);
+    double k = (eff * 1e-6) / (RANGES[range_idx].resistance_ohms * c_eq);
+    // Same sane-geometry bound the two-point solver enforces: a K outside this
+    // range means a bad reference or a saturated/failed capture, not physics.
+    if (k <= 0.01 || k > 2.0) return -1.0;
+    return k;
 }
 
 // Two-point calibration: with TWO references on the SAME range we solve BOTH
@@ -1254,14 +1257,17 @@ static void system_hw_init(void)
 // inversion, not before).  The previous code subtracted stray first, which is
 // wrong and increasingly so as C_eq approaches C_block.
 //
-// Recover (C_dut + C_stray) from the measured series-equivalent C_eq.
+// Recover (C_dut + C_stray) from the measured series-equivalent C_eq by
+// inverting the C_block series combination.  This is the EXACT algebraic inverse
+// of cblock_forward() — the transform every calibration solver applies
+// UNCONDITIONALLY — so there must be no minimum-capacitance gate here: any gate
+// would make calibration and measurement disagree for references/DUTs below it.
 // Returns the total node capacitance, or a negative sentinel when C_eq is at/
 // above the singularity (C_eq ≥ C_block makes the inversion non-physical).
 // The caller must treat that as an out-of-range rejection, not a reading.
 static double cblock_invert(double c_eq)
 {
     double cb = c_block_f();
-    if (c_eq < C_BLOCK_CORRECT_MIN_F) return c_eq;      // negligible correction
     if (c_eq >= 0.9 * cb) return -1.0;                  // at/past singularity
     return (c_eq * cb) / (cb - c_eq);                   // DUT + stray
 }
@@ -1962,6 +1968,19 @@ static sample_t measure_adc_range(uint8_t range_idx)
     static int     mvs[RC_FIT_MAX_PTS];
     int     npts = 0;
 
+    // Adaptive decimation.  A fixed 64-point buffer fills during the early,
+    // near-linear part of a LONG-τ charge (a 360 µF DUT on 100 Ω has τ ≈ 28 ms;
+    // at ~100 µs/poll, 64 points span only ~6 ms), so the joint V_inf/τ fit is
+    // ill-conditioned and converges on a bogus low asymptote (V_inf ≈ 1.6 V
+    // instead of 3.3 V) — which then also poisons any calibration using it.
+    // When the buffer fills we keep every other point and double the store
+    // interval, so the 64 points always span the whole curve (logarithmic-in-
+    // time coverage).  Short-τ captures never fill the buffer, so they are
+    // unchanged.
+    int64_t store_interval_us = 0;   // 0 = store every eligible poll
+    int64_t t_last_store = 0;
+    int     v_peak = 0;              // highest mV seen (any point, stored or not)
+
     // Capture the node voltage at the step edge as the fit's V0.  The node is
     // held low and stable here, so this is the best estimate of the start level.
     int v0_step = adc_read_avg_mv(5);
@@ -1999,20 +2018,36 @@ static sample_t measure_adc_range(uint8_t range_idx)
         }
         mv = (int)(acc / got);
         int64_t now = (t_before + esp_timer_get_time()) / 2;
+        if (mv > v_peak) v_peak = mv;
 
         if ((now - t_last_feed) > 500000LL) {
             esp_task_wdt_reset();
             t_last_feed = now;
         }
 
-        if (t_start < 0 && mv >= v_low) t_start = now;
+        if (t_start < 0 && mv >= v_low) { t_start = now; t_last_store = now; }
         if (t_tau < 0 && mv >= v_tau) t_tau = now;
 
-        // record points once we are past the start floor
-        if (t_start >= 0 && mv >= v_low && npts < RC_FIT_MAX_PTS) {
+        // Record points once past the start floor, at the current decimation
+        // interval.  When the buffer is full, halve it (keep even indices) and
+        // double the interval so the remaining points cover the tail.
+        if (t_start >= 0 && mv >= v_low &&
+            (npts == 0 || (now - t_last_store) >= store_interval_us)) {
+            if (npts >= RC_FIT_MAX_PTS) {
+                int k2 = 0;
+                for (int j = 0; j < npts; j += 2, ++k2) {
+                    ts[k2] = ts[j];
+                    mvs[k2] = mvs[j];
+                }
+                npts = k2;
+                int64_t span = (npts > 1) ? (ts[npts - 1] - ts[0]) : 0;
+                store_interval_us = (npts > 1) ? (span / (npts - 1)) : 1;
+                if (store_interval_us < 1) store_interval_us = 1;
+            }
             ts[npts] = now;
             mvs[npts] = mv;
             npts++;
+            t_last_store = now;
         }
 
         if (mv >= v_stop) break;                 // captured past τ
@@ -2037,7 +2072,14 @@ static sample_t measure_adc_range(uint8_t range_idx)
     // V0 is the node voltage measured just before the step.
     double t0_hint = (npts > 0) ? (double)(t_begin - ts[0]) : 0.0;
     rc_fit_t fit = rc_exp_fit(ts, mvs, npts, v_inf, v0_step, t0_hint);
-    if (fit.ok && fit.r2 > 0.90 && fit.tau_us > 0.0) {
+    // The fitted asymptote can never be below the highest voltage actually
+    // observed (the model cannot exceed V_inf).  If it is, the capture did not
+    // see enough curvature and the fit locked onto a spurious low asymptote —
+    // distrust it and let the two-threshold fallback (which uses the measured
+    // settle V_inf) produce τ instead.
+    bool fit_ok = fit.ok && fit.r2 > 0.90 && fit.tau_us > 0.0 &&
+                  (double)fit.v_inf_mv >= (double)v_peak - 20.0;
+    if (fit_ok) {
         tau_us = fit.tau_us;
         fit_r2 = fit.r2;
         fit_rmse = fit.rmse_mv;
@@ -2887,11 +2929,20 @@ static void dbg_print_state(int range_idx)
         double eff_us = 1e6 / f - off_us;
         double c_eq = (eff_us * 1e-6) / (osc_k((uint8_t)range_idx) *
                                          RANGES[range_idx].resistance_ohms);
-        double c = use_t0 ? c_eq : (c_eq - STRAY_CAPACITANCE_F);
-        printf("  -> implied C = %.3f nF  (K=%.4f %s=%.2fus R=%s%s)\n",
-               c * 1e9, osc_k((uint8_t)range_idx), use_t0 ? "T0" : "delay",
-               off_us, RANGES[range_idx].label,
-               g_osc_cal[range_idx].valid ? " cal" : " default");
+        // Same reconstruction as measure_osc_range(): invert the C_block series
+        // combo, then (un-tared only) subtract the nominal stray.  NOTE: f above
+        // is a raw 100 ms PCNT snapshot for hardware bring-up, NOT the reciprocal
+        // estimator the measurement uses, so this figure is indicative only.
+        double c_total = cblock_invert(c_eq);
+        double c = (c_total < 0.0) ? c_total
+                                   : (use_t0 ? c_total : (c_total - STRAY_CAPACITANCE_F));
+        if (c < 0.0)
+            printf("  -> implied C = out of range (C_eq ≥ C_block)\n");
+        else
+            printf("  -> implied C = %.3f nF  (K=%.4f %s=%.2fus R=%s%s)\n",
+                   c * 1e9, osc_k((uint8_t)range_idx), use_t0 ? "T0" : "delay",
+                   off_us, RANGES[range_idx].label,
+                   g_osc_cal[range_idx].valid ? " cal" : " default");
     }
     printf("-----------------\n\n");
 }
@@ -3006,13 +3057,36 @@ static double g_cal_ref1 = 0.0;
 static double dbg_capture_point(int range_idx, double ref_pf, double *ref_c_out)
 {
     *ref_c_out = ref_pf * 1e-12;
+    // Identical front-end setup to measure_osc_range(): select the range's mux
+    // channel, then isolate/prepare the node.  Skipping this let the capture run
+    // on whatever mux channel the previous measurement left selected (the
+    // console range and the physical mux can differ in normal autoranging mode),
+    // so the solved K would not match the runtime measurement path.
+    select_mux_channel(RANGES[range_idx].mux_channel);
+    esp_rom_delay_us(5);
+    prepare_measurement();
     double f = 0.0;
-    if (!osc_read_freq(&f, NULL) || f <= 0.0) {
+    uint32_t nper = 0;
+    if (!osc_read_freq(&f, &nper) || f <= 0.0) {
         printf(">> no oscillation / unsafe count on %s (check loop on scope)\n",
                RANGES[range_idx].label);
         return -1.0;
     }
-    printf(">> point: %s ref=%.1f pF  f=%.1f Hz\n", RANGES[range_idx].label, ref_pf, f);
+    // Apply the SAME acceptance gates measure_osc_range() applies, so we never
+    // calibrate against a frequency the runtime would reject as too slow/fast or
+    // too few edges.
+    if (f < OSC_MIN_F_HZ || f > 1000000.0) {
+        printf(">> CAL FAILED: %s f=%.1f Hz outside the measurement window "
+               "(%.0f Hz – 1 MHz).\n", RANGES[range_idx].label, f, OSC_MIN_F_HZ);
+        return -1.0;
+    }
+    if (nper < 4) {
+        printf(">> CAL FAILED: %s only %u edges averaged (< 4).\n",
+               RANGES[range_idx].label, (unsigned)nper);
+        return -1.0;
+    }
+    printf(">> point: %s ref=%.1f pF  f=%.1f Hz  (%u periods)\n",
+           RANGES[range_idx].label, ref_pf, f, (unsigned)nper);
     return f;
 }
 
@@ -3184,9 +3258,14 @@ static double adc_capture_point(int range_idx, double ref_pf,
     *ref_c_out = ref_pf * 1e-12;
     if (v_inf_mv_out) *v_inf_mv_out = (double)g_v_inf_cache[range_idx];
     sample_t s = measure_adc_range((uint8_t)range_idx);
-    if (!s.valid || s.tau_us <= 0.0) {
-        printf(">> ADC: no usable τ on %s (reference out of the clean window?)\n",
-               RANGES[range_idx].label);
+    // Require the SAME acceptance the runtime fusion applies (`plausible`), not
+    // merely `valid`: a τ below the clean-window floor (or a stray-dominated
+    // reading) is marked valid-but-not-plausible and would otherwise be used to
+    // solve a calibration that the measurement itself would reject.
+    if (!s.valid || !s.plausible || s.tau_us <= 0.0) {
+        printf(">> ADC: no PLAUSIBLE τ on %s (ref %.4g pF out of the clean "
+               "window? τ=%.1f us).\n",
+               RANGES[range_idx].label, ref_pf, s.tau_us);
         return -1.0;
     }
     if (v_inf_mv_out) *v_inf_mv_out = s.v_inf_mv;   // exact asymptote this τ used
@@ -3548,6 +3627,7 @@ static bool console_handle_hw(const char *line)
     }
     if (!strncmp(line, "boardclear", 10)) {
         board_cal_reset();
+        invalidate_vinf_cache();   // range resistances reverted: V_inf divider moved
         printf(">> board constants reset to compiled defaults (NVS cleared)\n");
         return true;
     }
@@ -3569,6 +3649,7 @@ static bool console_handle_hw(const char *line)
         if (ok) {
             board_cal_save();
             g_board_cal_overridden = true;
+            invalidate_vinf_cache();   // R_chain/C_block changed: V_inf divider moved
             printf(">> board %s = %g (stored to NVS)\n", field, value);
             evt_ack("boardset", 1, field);
         }

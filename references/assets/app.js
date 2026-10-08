@@ -101,7 +101,7 @@
         "C_eq @ 470 nF": "≈ 470 nF",
         "C_eq @ 1000 µF": "484 µF (firmware-corrected)",
       },
-      note: "Above 1 µF the firmware inverts the series combination before subtracting stray C.",
+      note: "The firmware inverts the series combination before subtracting stray C (applied unconditionally — the exact inverse of the calibration forward transform).",
     },
     cnf: {
       name: "67.8 nF HF bypass",
@@ -667,7 +667,7 @@
     txt(S.fg, 1192, 420, "3 · log-domain weighted mean", "lbl-sm");
     txt(S.fg, 1192, 450, "4 · ADC vs OSC mismatch > 1.5×", "lbl-sm");
     txt(S.fg, 1192, 470, "   → flag, still report fused value", "lbl-sm");
-    txt(S.fg, 1192, 500, "5 · C_block series inversion > 1 µF", "lbl-sm");
+    txt(S.fg, 1192, 500, "5 · C_block series inversion", "lbl-sm");
 
     arrow(S.bg, 232, 398, 298, 398, "analog");
     arrow(S.bg, 522, 398, 588, 398, "analog");
@@ -900,7 +900,7 @@
     ["RC step", "V(t) = V_inf (1 − e^(−t/τ))", "Fit the rising exponential; the slope of ln(V_inf − V) is −1/τ. Then τ = R_eff·C_eq."],
     ["Per-range asymptote", "R_leak = V_inf·R / (V_nom − V_inf)", "R_bias and leakage pull V_inf below 3.3 V; it is measured per range and R_leak is folded into R_eff."],
     ["Oscillator model", "T = K·R·C_dut + T0", "K is a dimensionless geometry constant, T0 a measured per-range offset. Both are solved by calibration and stored in NVS."],
-    ["C_block series", "C_eq = C_b·C_d / (C_b + C_d)", "Above 1 µF, invert the 936 µF series combination first, then subtract parallel stray C."],
+    ["C_block series", "C_eq = C_b·C_d / (C_b + C_d)", "Invert the 936 µF series combination first, then subtract parallel stray C (applied unconditionally)."],
     ["ADC quality", "q = q_time·q_stray·q_range·q_fit", "Each sample is scored by how well the physics assumptions hold, not by a single confidence flag."],
     ["Fusion", "C = exp( Σ w ln C / Σ w )", "Median-gate outliers, then a quality-weighted geometric mean across every surviving (range, method) sample."],
   ].map(([h, f, t]) => `<div class="panel card"><span class="br"></span><span class="bl"></span><h3>${h}</h3><div class="formula">${f}</div><p>${t}</p></div>`).join("");
