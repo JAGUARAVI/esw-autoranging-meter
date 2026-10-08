@@ -109,11 +109,36 @@ static inline int64_t atomic_read_i64(volatile int64_t *p)
 // Below this the ADC is not trustworthy: its τ resolution cannot resolve the
 // signal above its own offset.  Small DUTs are measured by the oscillator only.
 #define ADC_SUBNF_GATE_F 1.0e-9
-// C_block (1000 uF) sits in series with the DUT on the AC measurement path.
+// ---------------------------------------------------------------------------
+// Board component values (MEASURED on this unit, not the nominal BOM values)
+// ---------------------------------------------------------------------------
+// These feed the same calibration/measurement math as the runtime reference
+// calibration, so using the measured parts removes a systematic error before
+// any reference cap is ever fitted.  A per-unit NVS override (namespace
+// "board_cal") can supersede any of them without a reflash; see
+// board_cal_load() / board_cal_save() / board_cal_reset() below.
+//
+// C_block sits in series with the DUT on the AC measurement path.  On this
+// board it is a 936 uF electrolytic with a 67.8 nF ceramic HF bypass placed
+// ACROSS it (parallel), so the DUT sees the parallel sum in series.  The
+// bypass is the part that actually carries the fast oscillator edges, so it is
+// kept as its own constant even though it vanishes beside the electrolytic.
 // C_eq = C_b*C_d/(C_b+C_d)  =>  C_d = C_eq*C_b/(C_b-C_eq).  Correcting removes
 // the growing underestimate for DUTs approaching C_block (per schematic note).
-#define C_BLOCK_F 1000.0e-6
+#define C_BLOCK_ELEC_F 936.0e-6   // measured electrolytic (nominal 1000 uF)
+#define C_BLOCK_HF_F   67.8e-9    // measured HF bypass     (nominal 100 nF)
+#define C_BLOCK_F      (C_BLOCK_ELEC_F + C_BLOCK_HF_F)
 #define C_BLOCK_CORRECT_MIN_F 1.0e-6  // only worth applying above ~1 uF
+
+// "RES bank" — the four range resistors, in RANGES[] index order (measured).
+#define RES_100_OHM   98.9        // nominal 100 Ω
+#define RES_1K_OHM    993.6       // nominal 1 kΩ
+#define RES_100K_OHM  98.6e3      // nominal 100 kΩ
+#define RES_1M_OHM    1.01e6      // nominal 1 MΩ
+
+// "Rblock" — DC bias injection resistor V_BIAS → N_DUT (stiff for DC, open for
+// AC, so it holds the bias without loading the measurement).
+#define R_BIAS_OHM    4.8e6       // nominal 4.7 MΩ
 
 #define RANGE_COUNT 4
 #define PROBE_MIN_VALID_US 200 // probe on a "slow" range trusts τ ≥ this
@@ -258,13 +283,83 @@ static uint32_t g_last_cycle_ms = 0;
 // ---------------------------------------------------------------------------
 // Range table — note: on the schematic the 1 MΩ channel shares the mux with
 // the 100 nF HF-bypass branch; keep the channel numbering used in production.
+// resistance_ohms is the *measured* range resistor (RES_* defaults above); an
+// NVS board_cal override can replace it per unit, so this table is non-const.
 // ---------------------------------------------------------------------------
-static const range_config_t RANGES[RANGE_COUNT] = {
-    {2, 100.0, "100 Ω"},
-    {1, 1000.0, "1 kΩ"},
-    {0, 100000.0, "100 kΩ"},
-    {3, 1000000.0, "1 MΩ"},
+static range_config_t RANGES[RANGE_COUNT] = {
+    {2, RES_100_OHM,   "100 Ω"},
+    {1, RES_1K_OHM,    "1 kΩ"},
+    {0, RES_100K_OHM,  "100 kΩ"},
+    {3, RES_1M_OHM,    "1 MΩ"},
 };
+
+// Effective board values: start from the compiled defaults and let a per-unit
+// NVS copy override them.  RANGES[] is non-const so a stored range-resistor
+// override is seen everywhere the resistance is read.
+static double g_c_block_f  = C_BLOCK_F;
+static double g_r_bias_ohm = R_BIAS_OHM;
+static bool   g_board_cal_overridden = false;  // true if NVS supplied any value
+
+static inline double c_block_f(void)  { return g_c_block_f; }
+static inline double r_bias_ohm(void) { return g_r_bias_ohm; }
+
+#define BOARD_CAL_NVS_NS "board_cal"
+
+// Load per-unit board constants from NVS (if present).  Absent keys leave the
+// compiled #defines in place, so a board that was never re-measured behaves
+// exactly as the defaults.
+static void board_cal_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(BOARD_CAL_NVS_NS, NVS_READONLY, &h) != ESP_OK) return;
+    int64_t v = 0;
+    if (nvs_get_i64(h, "cblk",  &v) == ESP_OK) { g_c_block_f  = (double)v / 1e15; g_board_cal_overridden = true; } // fF
+    if (nvs_get_i64(h, "rbias", &v) == ESP_OK) { g_r_bias_ohm = (double)v / 1e3;  g_board_cal_overridden = true; } // mΩ
+    for (int i = 0; i < RANGE_COUNT; ++i) {
+        char key[8];
+        snprintf(key, sizeof(key), "r%d", i);
+        if (nvs_get_i64(h, key, &v) == ESP_OK) {
+            RANGES[i].resistance_ohms = (double)v / 1e3;   // mΩ
+            g_board_cal_overridden = true;
+        }
+    }
+    nvs_close(h);
+}
+
+static esp_err_t board_cal_save(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(BOARD_CAL_NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    nvs_set_i64(h, "cblk",  (int64_t)(g_c_block_f * 1e15));
+    nvs_set_i64(h, "rbias", (int64_t)(g_r_bias_ohm * 1e3));
+    for (int i = 0; i < RANGE_COUNT; ++i) {
+        char key[8];
+        snprintf(key, sizeof(key), "r%d", i);
+        nvs_set_i64(h, key, (int64_t)(RANGES[i].resistance_ohms * 1e3));
+    }
+    err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
+// Restore every board constant to its compiled default and drop the NVS copy.
+static void board_cal_reset(void)
+{
+    g_c_block_f  = C_BLOCK_F;
+    g_r_bias_ohm = R_BIAS_OHM;
+    RANGES[0].resistance_ohms = RES_100_OHM;
+    RANGES[1].resistance_ohms = RES_1K_OHM;
+    RANGES[2].resistance_ohms = RES_100K_OHM;
+    RANGES[3].resistance_ohms = RES_1M_OHM;
+    g_board_cal_overridden = false;
+    nvs_handle_t h;
+    if (nvs_open(BOARD_CAL_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_erase_all(h);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
 
 static adc_oneshot_unit_handle_t adc_handle;
 static adc_cali_handle_t adc_cali_handle;
@@ -452,19 +547,34 @@ static esp_err_t adc_cal_save(void)
     return err;
 }
 
-// Solve the two-point model τ = R_eff·(C + C0):
-//      R_eff = (τ1 − τ2)/(C1 − C2),   C0 = τ1/R_eff − C1
+// Solve the two-point model τ = R_eff·C_eq, where C_eq is the SAME
+// series-equivalent the runtime measures and inverts:
+//      C_eq = cblock_forward(C_ref) = C_block·C_ref/(C_block + C_ref)
+//      R_eff = (τ1 − τ2)/(C_eq1 − C_eq2),   C0 = τ1/R_eff − C_eq1
+// Applying the C_block transform here is mandatory.  The measurement inverts it
+// (cblock_invert), so a solve that used the RAW reference capacitance would be a
+// different model: it stores an R_eff scaled by cblock_forward(C)/C (≈0.72 for a
+// 360 µF reference) and a bogus µF-scale C0 that then fails the sanity bound.
+// The oscillator solvers apply the identical transform; this mirrors them.
+// Returns the EFFECTIVE R_eff (chain ∥ leakage); the caller converts it back to
+// the stored chain value with adc_chain_from_eff() so the runtime leak fold in
+// adc_effective_r() reproduces it exactly.
+static double cblock_forward(double c_dut);   // defined below
+
 static bool adc_cal_solve_two(double tau1_us, double c1_f,
                               double tau2_us, double c2_f,
                               double *r_eff, double *c0_f)
 {
     if (tau1_us <= 0.0 || tau2_us <= 0.0) return false;
-    double dc = c1_f - c2_f;
+    double ceq1 = cblock_forward(c1_f);
+    double ceq2 = cblock_forward(c2_f);
+    if (ceq1 <= 0.0 || ceq2 <= 0.0) return false;     // ref at/above C_block
+    double dc = ceq1 - ceq2;
     if (fabs(dc) < 1e-18) return false;               // refs too similar
     double r = ((tau1_us - tau2_us) * 1e-6) / dc;
     if (r <= 1.0 || r > 1e7) return false;            // sane ohms
-    double off = (tau1_us * 1e-6) / r - c1_f;
-    if (off < -1e-9 || off > 1e-6) return false;      // sane 0..1 µF
+    double off = (tau1_us * 1e-6) / r - ceq1;         // node offset (pF–nF)
+    if (off < -1e-7 || off > 1e-6) return false;      // sane −0.1..1 µF
     *r_eff = r;
     *c0_f = off;
     return true;
@@ -478,8 +588,9 @@ static bool adc_cal_solve_two(double tau1_us, double c1_f,
 // measurement model (cblock_invert).
 static double cblock_forward(double c_dut)
 {
-    if (c_dut >= C_BLOCK_F) return -1.0;            // beyond singularity
-    return (C_BLOCK_F * c_dut) / (C_BLOCK_F + c_dut);
+    double cb = c_block_f();
+    if (c_dut >= cb) return -1.0;                   // beyond singularity
+    return (cb * c_dut) / (cb + c_dut);
 }
 
 // One-point calibration: solve K.
@@ -684,7 +795,15 @@ static bool g_fe_finish_pending = false; // deferred finish after a 'stop' abort
 // slowly, so the budget scales with the range resistor).
 static bool wait_for_start_threshold(uint8_t range_idx)
 {
+    // Bleed V_cap below V_START before the timed charge.  The RC here is
+    // (R_range+R_series)·C_eq, so a large DUT on the LOW ranges needs far more
+    // than the old 100 ms + 2·R µs: a 360 µF DUT (C_eq ≈ 260 µF) takes ~60 ms on
+    // 100 Ω but ~0.6 s on 1 kΩ, which the old budget rejected outright.  Give the
+    // 100 Ω / 1 kΩ ranges a floor that covers the large electrolytics they exist
+    // for; the loop still returns the instant the threshold is crossed, so this
+    // costs nothing in the normal case.
     int64_t budget_us = 100000LL + (int64_t)(RANGES[range_idx].resistance_ohms * 2.0);
+    if (range_idx <= 1 && budget_us < 3000000LL) budget_us = 3000000LL; // 3 s
     int64_t t0 = esp_timer_get_time();
     while ((esp_timer_get_time() - t0) < budget_us) {
         if (g_abort_cycle) return false;   // service an exclusive command promptly
@@ -1141,9 +1260,10 @@ static void system_hw_init(void)
 // The caller must treat that as an out-of-range rejection, not a reading.
 static double cblock_invert(double c_eq)
 {
+    double cb = c_block_f();
     if (c_eq < C_BLOCK_CORRECT_MIN_F) return c_eq;      // negligible correction
-    if (c_eq >= 0.9 * C_BLOCK_F) return -1.0;           // at/past singularity
-    return (c_eq * C_BLOCK_F) / (C_BLOCK_F - c_eq);     // DUT + stray
+    if (c_eq >= 0.9 * cb) return -1.0;                  // at/past singularity
+    return (c_eq * cb) / (cb - c_eq);                   // DUT + stray
 }
 
 // Compact capacitance pretty-printer (two buffers so a caller can pass two).
@@ -1714,7 +1834,11 @@ static int adc_asymptote_for_range(uint8_t range_idx, int v_start)
 
     gpio_set_level(DRIVE_PIN, 1);
     int64_t t0 = esp_timer_get_time();
-    int64_t settle_budget = (range_idx <= 1) ? 400000LL : 1500000LL; // us
+    // The asymptote needs ~5τ to settle.  A 360 µF DUT on 1 kΩ has τ ≈ 0.26 s,
+    // so the old 400 ms budget stopped while the node was still ~0.7 V short of
+    // its true plateau and cached a bogus V_inf.  Give the 100 Ω / 1 kΩ ranges a
+    // budget that covers the large electrolytics they exist for.
+    int64_t settle_budget = (range_idx <= 1) ? 3000000LL : 1500000LL; // us
     int v_inf = 0;
     int v_prev = v_start;
     while ((esp_timer_get_time() - t0) < settle_budget) {
@@ -1735,6 +1859,39 @@ static int adc_asymptote_for_range(uint8_t range_idx, int v_start)
     prepare_measurement();
     if (v_inf > 0) g_v_inf_cache[range_idx] = v_inf;
     return v_inf;
+}
+
+// ---------------------------------------------------------------------------
+// Effective series resistance of the RC-step — the ONE place this is defined.
+// ---------------------------------------------------------------------------
+// The node asymptotes to V_inf because R_bias/leakage forms a divider with the
+// range chain, so the resistance that actually sets τ is the parallel
+// combination of the stored chain resistance and that leakage path:
+//      R_leak = V_inf·R_chain / (V_nom − V_inf)
+//      R_eff  = R_chain ∥ R_leak
+// Both the runtime measurement and the ADC calibration MUST use this exact
+// function (and its inverse below), or a solved R_eff would not reproduce the
+// reference and the two paths would silently disagree.
+static double adc_effective_r(double r_chain, double v_inf_mv)
+{
+    if (r_chain <= 0.0) return r_chain;
+    if (v_inf_mv >= (double)V_NOMINAL_MV - 50.0) return r_chain;   // no droop: no leak fold
+    double r_leak = (v_inf_mv * r_chain) / ((double)V_NOMINAL_MV - v_inf_mv + 1e-9);
+    if (r_leak <= 0.0) return r_chain;
+    return (r_chain * r_leak) / (r_chain + r_leak);                // parallel
+}
+
+// Exact inverse of adc_effective_r(): recover the chain resistance that maps
+// back to a solved effective resistance under the same asymptote.  Since
+// R_leak ∝ R_chain (R_leak = a·R_chain with a = V_inf/(V_nom−V_inf)),
+// R_eff = R_chain·a/(1+a)  ⇒  R_chain = R_eff·(1+a)/a.
+static double adc_chain_from_eff(double r_eff, double v_inf_mv)
+{
+    if (r_eff <= 0.0) return r_eff;
+    if (v_inf_mv >= (double)V_NOMINAL_MV - 50.0) return r_eff;     // no fold was applied
+    double a = v_inf_mv / ((double)V_NOMINAL_MV - v_inf_mv + 1e-9);
+    if (a <= 0.0) return r_eff;
+    return r_eff * (1.0 + a) / a;
 }
 
 // ---------------------------------------------------------------------------
@@ -1916,11 +2073,9 @@ static sample_t measure_adc_range(uint8_t range_idx)
     double r_range = RANGES[range_idx].resistance_ohms;
     double r_chain = adc_cal_valid(range_idx) ? adc_r_eff(range_idx) : r_range;
     if (r_chain <= 0.0) r_chain = r_range;
-    double r_leak = (v_inf_eff * r_chain) / ((double)V_NOMINAL_MV - v_inf_eff + 1e-9);
-    double r_eff = r_chain;
-    if (v_inf_eff < V_NOMINAL_MV - 50 && r_leak > 0.0) {
-        r_eff = (r_chain * r_leak) / (r_chain + r_leak); // parallel
-    }
+    // Fold in the leakage path implied by the measured asymptote droop — via the
+    // shared helper so the calibration's inverse uses the identical formula.
+    double r_eff = adc_effective_r(r_chain, v_inf_eff);
 
     // Stream the captured charge curve + fitted exponential for the UI graph.
     // Emit the *fitted* asymptote/origin (when available) so the host ghost
@@ -3019,19 +3174,24 @@ static void dbg_calibrate(int range_idx, const char *cmd, double ref_pf)
 // ---------------------------------------------------------------------------
 // ADC (RC-step) calibration commands
 // ---------------------------------------------------------------------------
-// Capture the effective τ on a range using the exact runtime path, so the
-// solved R_eff matches what measure_adc_range() will later apply.
-static double adc_capture_point(int range_idx, double ref_pf, double *ref_c_out)
+// Capture the effective τ (and the asymptote V_inf used) on a range using the
+// exact runtime path, so the solved R_eff matches what measure_adc_range() will
+// later apply.  V_inf is returned because the chain↔effective resistance
+// conversion depends on the same leakage ratio the measurement will use.
+static double adc_capture_point(int range_idx, double ref_pf,
+                                double *ref_c_out, double *v_inf_mv_out)
 {
     *ref_c_out = ref_pf * 1e-12;
+    if (v_inf_mv_out) *v_inf_mv_out = (double)g_v_inf_cache[range_idx];
     sample_t s = measure_adc_range((uint8_t)range_idx);
     if (!s.valid || s.tau_us <= 0.0) {
         printf(">> ADC: no usable τ on %s (reference out of the clean window?)\n",
                RANGES[range_idx].label);
         return -1.0;
     }
-    printf(">> ADC point: %s ref=%.4g pF  tau=%.1f us  R2=%.3f\n",
-           RANGES[range_idx].label, ref_pf, s.tau_us, s.fit_r2);
+    if (v_inf_mv_out) *v_inf_mv_out = s.v_inf_mv;   // exact asymptote this τ used
+    printf(">> ADC point: %s ref=%.4g pF  tau=%.1f us  Vinf=%.0f mV  R2=%.3f\n",
+           RANGES[range_idx].label, ref_pf, s.tau_us, s.v_inf_mv, s.fit_r2);
     return s.tau_us;
 }
 
@@ -3039,25 +3199,27 @@ static bool   g_adccal_pending = false;
 static int    g_adccal_range = -1;
 static double g_adccal_tau1 = 0.0;
 static double g_adccal_ref1 = 0.0;
+static double g_adccal_v_inf1 = 0.0;
 
-// 'adccal <ref_pF>'                      — one-point: R_eff = τ/C_ref
-// 'adccal1 <ref_pF>' then 'adccal2 <ref_pF>' — two-point: R_eff AND C0
+// 'adccal <ref_pF>'                      — one-point: solve R_chain (C0 estimated)
+// 'adccal1 <ref_pF>' then 'adccal2 <ref_pF>' — two-point: solve R_chain AND C0
 static void dbg_adccal(int range_idx, const char *cmd, double ref_pf)
 {
     bool two_first  = (strncmp(cmd, "adccal1", 7) == 0);
     bool two_second = (strncmp(cmd, "adccal2", 7) == 0);
 
     if (two_first) {
-        double ref_c;
-        double tau = adc_capture_point(range_idx, ref_pf, &ref_c);
+        double ref_c, v_inf = 0.0;
+        double tau = adc_capture_point(range_idx, ref_pf, &ref_c, &v_inf);
         if (tau <= 0.0) { g_adccal_pending = false; return; }
         g_adccal_pending = true;
         g_adccal_range = range_idx;
         g_adccal_tau1 = tau;
         g_adccal_ref1 = ref_c;
+        g_adccal_v_inf1 = v_inf;
         evt_adccalpt(range_idx, "adccal1", ref_pf, tau);
-        printf(">> ADC point 1 captured on %s. Fit a DIFFERENT reference and run "
-               "'adccal2 <ref_pF>'.\n", RANGES[range_idx].label);
+        printf(">> ADC point 1 captured on %s (Vinf=%.0f mV). Fit a DIFFERENT reference "
+               "and run 'adccal2 <ref_pF>'.\n", RANGES[range_idx].label, v_inf);
         return;
     }
 
@@ -3067,11 +3229,14 @@ static void dbg_adccal(int range_idx, const char *cmd, double ref_pf)
                    RANGES[range_idx].label);
             return;
         }
-        double ref_c2;
-        double tau2 = adc_capture_point(range_idx, ref_pf, &ref_c2);
+        double ref_c2, v_inf2 = 0.0;
+        double tau2 = adc_capture_point(range_idx, ref_pf, &ref_c2, &v_inf2);
         if (tau2 <= 0.0) { g_adccal_pending = false; return; }
         evt_adccalpt(range_idx, "adccal2", ref_pf, tau2);
 
+        // Solve the EFFECTIVE R_eff, then invert the leakage fold with the exact
+        // same asymptote the measurement will use, so the stored *chain* R maps
+        // back through adc_effective_r() to the solved effective value.
         double r_eff, c0;
         if (!adc_cal_solve_two(g_adccal_tau1, g_adccal_ref1, tau2, ref_c2, &r_eff, &c0)) {
             printf(">> ADC CAL FAILED: two-point solve rejected (refs too similar / non-physical).\n");
@@ -3079,40 +3244,55 @@ static void dbg_adccal(int range_idx, const char *cmd, double ref_pf)
             g_adccal_pending = false;
             return;
         }
-        g_adc_cal[range_idx].r_eff_ohm = r_eff;
+        double v_inf = (v_inf2 > 0.0) ? v_inf2 : g_adccal_v_inf1;
+        double r_chain = adc_chain_from_eff(r_eff, v_inf);
+        if (r_chain <= 1.0 || r_chain > 1e7) {
+            printf(">> ADC CAL FAILED: bad chain R_eff (%.2f Ω).\n", r_chain);
+            evt_adccalres(range_idx, "two", 0.0, 0.0, 0);
+            g_adccal_pending = false;
+            return;
+        }
+        g_adc_cal[range_idx].r_eff_ohm = r_chain;
         g_adc_cal[range_idx].c0_f = c0;
         g_adc_cal[range_idx].valid = true;
         esp_err_t e = adc_cal_save();
-        printf(">> %s ADC TWO-POINT: R_eff=%.2f Ω (nom %.0f, +%.2f series)  C0=%.1f pF  %s\n",
-               RANGES[range_idx].label, r_eff, RANGES[range_idx].resistance_ohms,
-               r_eff - RANGES[range_idx].resistance_ohms, c0 * 1e12,
+        printf(">> %s ADC TWO-POINT: R_eff=%.2f Ω (nom %.0f, +%.2f series)  C0=%.1f pF  "
+               "[Vinf=%.0f mV, leak-fold]  %s\n",
+               RANGES[range_idx].label, r_chain, RANGES[range_idx].resistance_ohms,
+               r_chain - RANGES[range_idx].resistance_ohms, c0 * 1e12, v_inf,
                (e == ESP_OK) ? "saved to NVS" : "NVS SAVE FAILED");
-        evt_adccalres(range_idx, "two", r_eff, c0, 1);
+        evt_adccalres(range_idx, "two", r_chain, c0, 1);
         g_adccal_pending = false;
         return;
     }
 
-    // One-point: R_eff = τ / C_ref, offset seeded from the oscillator tare.
-    double ref_c;
-    double tau = adc_capture_point(range_idx, ref_pf, &ref_c);
+    // One-point: solve the EFFECTIVE R_eff = τ / cblock_forward(C_ref), then
+    // invert the leakage fold to the chain resistance.  The reference MUST pass
+    // through the same C_block series transform the measurement inverts, or
+    // R_eff comes out scaled by cblock_forward(C_ref)/C_ref (≈0.72 at 360 µF).
+    double ref_c, v_inf = 0.0;
+    double tau = adc_capture_point(range_idx, ref_pf, &ref_c, &v_inf);
     if (tau <= 0.0) return;
     evt_adccalpt(range_idx, "adccal", ref_pf, tau);
-    double r_eff = (tau * 1e-6) / ref_c;
-    if (r_eff <= 1.0 || r_eff > 1e7) {
-        printf(">> ADC CAL FAILED: bad R_eff (%.2f Ω).\n", r_eff);
+    double ceq = cblock_forward(ref_c);
+    double r_eff = (ceq > 0.0) ? (tau * 1e-6) / ceq : -1.0;
+    double r_chain = adc_chain_from_eff(r_eff, v_inf);
+    if (r_chain <= 1.0 || r_chain > 1e7) {
+        printf(">> ADC CAL FAILED: bad R_eff (%.2f Ω), ref at/above C_block?\n", r_chain);
         evt_adccalres(range_idx, "one", 0.0, 0.0, 0);
         return;
     }
     double c0 = node_stray_estimate_f((uint8_t)range_idx);
-    g_adc_cal[range_idx].r_eff_ohm = r_eff;
+    g_adc_cal[range_idx].r_eff_ohm = r_chain;
     g_adc_cal[range_idx].c0_f = c0;
     g_adc_cal[range_idx].valid = true;
     esp_err_t e = adc_cal_save();
-    printf(">> %s ADC ONE-POINT: R_eff=%.2f Ω (nom %.0f, +%.2f series)  C0=%.1f pF (est)  %s\n",
-           RANGES[range_idx].label, r_eff, RANGES[range_idx].resistance_ohms,
-           r_eff - RANGES[range_idx].resistance_ohms, c0 * 1e12,
+    printf(">> %s ADC ONE-POINT: R_eff=%.2f Ω (nom %.0f, +%.2f series)  C0=%.1f pF (est)  "
+           "[Vinf=%.0f mV, leak-fold]  %s\n",
+           RANGES[range_idx].label, r_chain, RANGES[range_idx].resistance_ohms,
+           r_chain - RANGES[range_idx].resistance_ohms, c0 * 1e12, v_inf,
            (e == ESP_OK) ? "saved to NVS" : "NVS SAVE FAILED");
-    evt_adccalres(range_idx, "one", r_eff, c0, 1);
+    evt_adccalres(range_idx, "one", r_chain, c0, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -3146,6 +3326,9 @@ static void console_help(void)
            "  adccal1 <pF>|adccal2 <pF>  two-point ADC R_eff+C0\n"
            "  adccal?              show ADC calibration table\n"
            "  adccalclear [0-3]    reset ADC calibration (current range or given)\n"
+           "  board?               show measured board constants (C_block/R_bias/RES bank)\n"
+           "  boardset <f> <val>   override one (cblock uF | rbias ohm | r0|r1|r2|r3 ohm) + store NVS\n"
+           "  boardclear           restore compiled board defaults (erase NVS override)\n"
            "  probe <0-3>          connectivity/charge probe of a range\n"
            "  stream on|off        emit @@EVT JSON telemetry\n"
            "  curve on|off         include full ADC charge curves in telemetry\n"
@@ -3351,6 +3534,47 @@ static bool console_handle_hw(const char *line)
         return true;
     }
 
+    // ---- Board component constants (measured; NVS-overridable) ----
+    if (!strcmp(line, "board?") || !strcmp(line, "board")) {
+        printf("\n--- Board constants (%s) ---\n",
+               g_board_cal_overridden ? "NVS override" : "compiled defaults");
+        printf("  C_block = %.4f uF  (elec %.1f uF + HF %.1f nF)\n",
+               c_block_f() * 1e6, C_BLOCK_ELEC_F * 1e6, C_BLOCK_HF_F * 1e9);
+        printf("  R_bias  = %.1f kΩ\n", r_bias_ohm() / 1e3);
+        for (int i = 0; i < RANGE_COUNT; ++i)
+            printf("  %-7s R = %.5g Ω\n", RANGES[i].label, RANGES[i].resistance_ohms);
+        printf("-----------------------------\n\n");
+        return true;
+    }
+    if (!strncmp(line, "boardclear", 10)) {
+        board_cal_reset();
+        printf(">> board constants reset to compiled defaults (NVS cleared)\n");
+        return true;
+    }
+    if (!strncmp(line, "boardset", 8)) {
+        char field[16];
+        double value = 0.0;
+        if (sscanf(line + 8, "%15s %lf", field, &value) != 2 || value <= 0.0) {
+            printf(">> usage: boardset cblock <uF> | rbias <ohm> | r0|r1|r2|r3 <ohm>\n");
+            return true;
+        }
+        bool ok = true;
+        if (!strcmp(field, "cblock"))
+            g_c_block_f = value * 1e-6;                       // uF
+        else if (!strcmp(field, "rbias"))
+            g_r_bias_ohm = value;                             // ohm
+        else if (field[0] == 'r' && field[1] >= '0' && field[1] <= '3' && field[2] == '\0')
+            RANGES[field[1] - '0'].resistance_ohms = value;   // ohm
+        else { ok = false; printf(">> unknown field '%s'\n", field); }
+        if (ok) {
+            board_cal_save();
+            g_board_cal_overridden = true;
+            printf(">> board %s = %g (stored to NVS)\n", field, value);
+            evt_ack("boardset", 1, field);
+        }
+        return true;
+    }
+
     if (!strncmp(line, "probe", 5)) {
         int rr = range_idx;
         for (int i = 5; line[i]; ++i)
@@ -3400,6 +3624,7 @@ static bool is_exclusive_cmd(const char *line)
     if (!strncmp(line, "probe", 5)) return true;
     if (!strncmp(line, "cal", 3) && strncmp(line, "cal?", 4) != 0) return true;
     if (!strncmp(line, "adccal", 6) && strncmp(line, "adccal?", 7) != 0) return true;
+    if (!strncmp(line, "boardset", 8) || !strncmp(line, "boardclear", 10)) return true;
     return false;
 }
 
@@ -3514,6 +3739,7 @@ void app_main(void)
 
     // Reuse the standard bring-up (outputs, mux, PCNT) but install our own ISR.
     system_hw_init();
+    board_cal_load();
     osc_cal_load();
     adc_cal_load();
     gpio_isr_handler_remove(LM393_OUT_PIN);
@@ -3594,6 +3820,7 @@ void app_main(void)
     if (nvs_err != ESP_OK) ESP_LOGW(TAG, "NVS init failed: %s", esp_err_to_name(nvs_err));
 
     system_hw_init();
+    board_cal_load();
     osc_cal_load();
     adc_cal_load();
 

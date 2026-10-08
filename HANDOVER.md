@@ -7,7 +7,7 @@
 
 The front-end has been successfully decoupled from the STM32's internal analog peripherals and adapted for the ESP32 using external discrete components.
 
-* **DC Bias Isolation ($C_{block}$):** The 1000 µF bulk blocking capacitor is fully integrated, isolating the 3.3V logic domain from the 0–20V external DC bias domain. The ESP32 ADC and drive pins sit safely at a 0V DC baseline.
+* **DC Bias Isolation ($C_{block}$):** The 936 µF bulk blocking capacitor (with a 67.8 nF ceramic HF bypass across it) is fully integrated, isolating the 3.3V logic domain from the 0–20V external DC bias domain. The ESP32 ADC and drive pins sit safely at a 0V DC baseline.
 * **External Schmitt Trigger:** An LM393 comparator replaces the STM32 COMP1. It is configured with a 1.65V mid-point reference (10 kΩ / 10 kΩ divider), a 100 kΩ positive feedback resistor for hysteresis, and a 10 kΩ pull-up on the open-collector output.
 * **Excitation Buffer:** An SN74LVC1G34 push-pull buffer is driven by the ESP32 to provide sharp, low-impedance 3.3V step excitation to the RC network.
 
@@ -122,6 +122,32 @@ measurement — so T0 cancels exactly. `dbg_measure_freq` was removed. Tared
 ranges also now allow a ~0 pF reading: small negative excursions around the tare
 baseline are clamped to 0 (not rejected), the tared noise floor is 0, and the
 tared `q_stray` term is 1.0 so an open socket reports ~0 pF instead of failing.
+
+### Board component constants (measured)
+
+The physical component values are now the **measured** values of this unit, not
+the nominal BOM values. They live as `#define` defaults near the top of
+`src/main.c` and feed both the C_block series-recovery math and the per-range
+`K`/`R_eff` calibration:
+
+| Constant | Measured | Nominal |
+| --- | --- | --- |
+| `C_BLOCK_ELEC_F` | 936 µF | 1000 µF |
+| `C_BLOCK_HF_F` | 67.8 nF | 100 nF |
+| `RES_100_OHM` | 98.9 Ω | 100 Ω |
+| `RES_1K_OHM` | 993.6 Ω | 1 kΩ |
+| `RES_100K_OHM` | 98.6 kΩ | 100 kΩ |
+| `RES_1M_OHM` | 1.01 MΩ | 1 MΩ |
+| `R_BIAS_OHM` (Rblock) | 4.8 MΩ | 4.7 MΩ |
+
+A per-unit override can be stored in NVS (namespace `board_cal`) without a
+reflash:
+
+* `board?` — show the effective values and whether NVS or the compiled defaults
+  are active.
+* `boardset cblock <µF>` / `boardset rbias <Ω>` / `boardset r0|r1|r2|r3 <Ω>` —
+  override one value and persist it.
+* `boardclear` — restore the compiled defaults and erase the NVS override.
 
 ## 5. Interactive Normal Mode & Web Dashboard
 

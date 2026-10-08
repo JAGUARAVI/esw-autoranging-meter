@@ -63,7 +63,7 @@
 | ADC calibration scheme | `esp_adc_cali_scheme_curve_fitting` (eFuse-based) | CONFIRMED (verification pending) |
 | External DC bias domain | 0–20 V | CONFIRMED |
 | Logic domain | 3.3 V, 0 V DC baseline on ESP32 side | CONFIRMED |
-| Blocking cap `C_block` | `1000 µF` | CONFIRMED |
+| Blocking cap `C_block` | `936 µF` measured (`1000 µF` nominal) `∥ 67.8 nF` HF bypass | CONFIRMED |
 | Parasitic node capacitance | ~`136 pF` (open socket) | CONFIRMED (measured on this board) |
 | ADC τ clean window | `250 µs` ≤ τ ≤ `4 s` for ADC range selection; quality plateau `200 µs`–`20 ms` | CONFIRMED |
 | Oscillator confirmation window | predicted `100 Hz`–`15000 Hz`; sweet spot `2000 Hz` | CONFIRMED |
@@ -87,9 +87,9 @@
 | Buffer | SN74LVC1G34 | Push-pull 3.3 V step excitation driver | CONFIRMED |
 | Analog mux | MAX4619 | Range-resistor selection (channels 0–3) | CONFIRMED |
 | Clamp | BAT54S | Dual Schottky clamp on V_cap node | CONFIRMED |
-| Blocking cap | `1000 µF` (`C_block`) | DC isolation between 3.3 V logic domain and 0–20 V bias domain | CONFIRMED |
+| Blocking cap | `936 µF` measured (`1000 µF` nominal) (`C_block`) | DC isolation between 3.3 V logic domain and 0–20 V bias domain | CONFIRMED |
 | Range resistors | `100 Ω`, `1 kΩ`, `100 kΩ`, `1 MΩ` | RC range selection | CONFIRMED |
-| Bias hold resistor | `1 MΩ` (`R_bias`) | Holds N_DUT at external bias | CONFIRMED |
+| Bias hold resistor | `4.8 MΩ` measured (`4.7 MΩ` nominal) (`R_bias`) | Holds N_DUT at external bias | CONFIRMED |
 | Comparator reference divider | `10 kΩ` / `10 kΩ` to `1.65 V` midpoint | LM393 reference | CONFIRMED |
 | Comparator hysteresis | `100 kΩ` positive feedback | Hysteresis | CONFIRMED |
 | Comparator pull-up | `10 kΩ` on open-collector output | Output pull-up | CONFIRMED |
@@ -119,17 +119,17 @@
 
 | Range index | Label | Resistance | Mux channel (A1:A0) |
 | --- | --- | --- | --- |
-| 0 | 100 Ω | `100.0` | 2 |
-| 1 | 1 kΩ | `1000.0` | 1 |
-| 2 | 100 kΩ | `100000.0` | 0 |
-| 3 | 1 MΩ | `1000000.0` | 3 |
+| 0 | 100 Ω | `98.9` (measured) | 2 |
+| 1 | 1 kΩ | `993.6` (measured) | 1 |
+| 2 | 100 kΩ | `98600.0` (measured) | 0 |
+| 3 | 1 MΩ | `1010000.0` (measured) | 3 |
 
 (Note: schematic shares the 1 MΩ channel with a 100 nF HF-bypass branch; channel numbering preserved from production.)
 
 **Signal paths (explicit):**
 - ESP32 `GPIO16` drives SN74LVC1G34 → sharp low-impedance 3.3 V step into the selected range resistor → RC node (V_cap across DUT + stray).
 - V_cap node is read by ADC1_CH9 (`GPIO10`), monitored by LM393 (`GPIO14`), and protected by BAT54S.
-- `C_block` (`1000 µF`) sits in series with the DUT on the measurement path, isolating the 3.3 V logic from the 0–20 V external bias domain.
+- `C_block` (`936 µF` measured, `1000 µF` nominal; with a `67.8 nF` HF bypass across it) sits in series with the DUT on the measurement path, isolating the 3.3 V logic from the 0–20 V external bias domain.
 - LM393 output feeds back in software: the ESP32 ISR mirrors the comparator level onto `GPIO16`, closing a hardware-in-the-loop relaxation oscillator.
 - SSR1 and SSR3 share `GPIO18` (hardware interlock: enabling precharge always clamps V_cap). SSR2 (`GPIO12`) is the only DUT ground path.
 
@@ -364,7 +364,7 @@ Not available. Component list (see §2.3) exists, but no prices, quantities, or 
 | τ (tau) | RC time constant; time to reach 63.2 % of final value |
 | V_inf | Measured per-range charge asymptote (mV) |
 | C_eq | Series-equivalent capacitance the circuit actually sees (before C_block inversion) |
-| C_block | `1000 µF` series blocking/DC-isolation capacitor |
+| C_block | `936 µF` measured (`1000 µF` nominal) series blocking/DC-isolation capacitor |
 | C_stray | Parasitic node capacitance (~136 pF here) |
 | T0 | Measured per-range open-node oscillator period offset (tare) |
 | K | Dimensionless oscillator geometry constant; `T = K·R·C + T0` |
@@ -375,7 +375,7 @@ Not available. Component list (see §2.3) exists, but no prices, quantities, or 
 | PCNT | ESP32 pulse-counter peripheral |
 | NVS | ESP32 non-volatile storage |
 | SSR | Solid-state relay (switches SSR1/SSR2/SSR3) |
-| R_bias | `1 MΩ` resistor holding N_DUT at bias |
+| R_bias | `4.8 MΩ` measured (`4.7 MΩ` nominal) resistor holding N_DUT at bias |
 | ESP-IDF | Espressif IoT Development Framework |
 | uPlot | Lightweight charting library (v1.6.32, vendored) |
 

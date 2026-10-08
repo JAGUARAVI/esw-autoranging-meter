@@ -69,11 +69,11 @@
       kind: "Timing resistors",
       loc: "Mux output → V_cap",
       chips: ["analog"],
-      bom: "1 MΩ / 100 kΩ / 1 kΩ / 100 Ω, 1 %",
+      bom: "1.01 MΩ / 98.6 kΩ / 993.6 Ω / 98.9 Ω measured (1 MΩ / 100 kΩ / 1 kΩ / 100 Ω nom.), 1 %",
       why: "Four decades of resistance let the RC product stay inside a clean timing window across pF–µF.",
       text: "1 MΩ and 100 kΩ carry the high-resolution oscillator work for small ceramics; 1 kΩ and 100 Ω bring large electrolytics into a fast ADC RC-step window. Calibration stores a measured R_eff per range.",
       facts: {
-        Ranges: "100 Ω · 1 kΩ · 100 kΩ · 1 MΩ",
+        Ranges: "98.9 Ω · 993.6 Ω · 98.6 kΩ · 1.01 MΩ (measured)",
         "Best OSC": "100 kΩ / 1 MΩ for pF–nF",
         "Best ADC": "1 kΩ / 100 Ω for µF",
       },
@@ -89,29 +89,29 @@
       facts: { Clamp: "−0.3 V to ~3.6 V", Protects: "GPIO10, GPIO14" },
     },
     cblock: {
-      name: "C_block 1000 µF ∥ 100 nF",
+      name: "C_block 936 µF ∥ 67.8 nF",
       kind: "DC block / AC couple",
       loc: "N_DUT → V_cap",
       chips: ["analog"],
-      bom: "1 × 1000 µF + 1 × 100 nF, ≥ 25 V",
+      bom: "1 × 936 µF (1000 µF nom.) + 1 × 67.8 nF (100 nF nom.), ≥ 25 V",
       why: "The ESP32 must never see the 0–20 V bias. C_block passes the AC measurement current and blocks the DC operating point.",
-      text: "The 1000 µF electrolytic lets the RC-step see large DUTs without the series capacitor dominating; the 100 nF ceramic bypasses its ESL for the fast oscillator edges. Effective series value is C_eq = (C_b·C_d)/(C_b+C_d).",
+      text: "The 936 µF electrolytic (nominal 1000 µF) lets the RC-step see large DUTs without the series capacitor dominating; the 67.8 nF ceramic (nominal 100 nF) bypasses its ESL for the fast oscillator edges. Effective series value is C_eq = (C_b·C_d)/(C_b+C_d).",
       facts: {
-        Values: "1000 µF ∥ 100 nF",
+        Values: "936 µF ∥ 67.8 nF (measured)",
         "C_eq @ 470 nF": "≈ 470 nF",
-        "C_eq @ 1000 µF": "500 µF (firmware-corrected)",
+        "C_eq @ 1000 µF": "484 µF (firmware-corrected)",
       },
       note: "Above 1 µF the firmware inverts the series combination before subtracting stray C.",
     },
     cnf: {
-      name: "100 nF HF bypass",
+      name: "67.8 nF HF bypass",
       kind: "Ceramic",
       loc: "Across C_block",
       chips: ["analog"],
-      bom: "1 × 100 nF, ≥ 25 V",
+      bom: "1 × 67.8 nF (100 nF nom.), ≥ 25 V",
       why: "Electrolytics look inductive above a few hundred kHz; oscillator edges need a real capacitor.",
-      text: "Parallel with the 1000 µF. Do not omit it in oscillator mode.",
-      facts: { Value: "100 nF", Dielectric: "C0G/X7R preferred" },
+      text: "Parallel with the 936 µF electrolytic. Do not omit it in oscillator mode.",
+      facts: { Value: "67.8 nF (100 nF nom.)", Dielectric: "C0G/X7R preferred" },
     },
     cdut: {
       name: "C_DUT — device under test",
@@ -124,14 +124,14 @@
       facts: { Example: "470 nF cal", Nodes: "N_DUT · GND" },
     },
     rbias: {
-      name: "1 MΩ R_bias",
+      name: "4.8 MΩ R_bias",
       kind: "DC injection",
       loc: "V_BIAS → N_DUT",
       chips: ["hv", "analog"],
-      bom: "1 × 1 MΩ, 1 %",
+      bom: "1 × 4.8 MΩ (4.7 MΩ nom.), 1 %",
       why: "Applies DC bias to the DUT without providing a low-impedance AC path that would kill the measurement.",
-      text: "Stiff for DC (sets the operating point), invisible for AC (1 MΩ ≫ any range resistor). During measurement it is the only path that holds N_DUT at V_BIAS.",
-      facts: { Value: "1 MΩ", "I at 20 V": "20 µA", Job: "DC bias, AC isolation" },
+      text: "Stiff for DC (sets the operating point), invisible for AC (4.8 MΩ ≫ any range resistor). During measurement it is the only path that holds N_DUT at V_BIAS.",
+      facts: { Value: "4.8 MΩ (4.7 MΩ nom.)", "I at 20 V": "4.2 µA", Job: "DC bias, AC isolation" },
     },
     ssr1: {
       name: "SSR1 — pre-charge",
@@ -161,7 +161,7 @@
       chips: ["analog"],
       bom: "1 × AQY212 / TLP241A",
       why: "Pre-charging N_DUT slams displacement current through C_block. Without a clamp, V_cap would jump and destroy GPIO10/GPIO14.",
-      text: "The most important safety part on the MCU side. GPIO18 turns it on with SSR1. The 1 Ω resistor eats the C_block inrush (Q = C·ΔV ≈ 1000 µF × 20 V = 20 mC); BAT54S only catches residual spikes.",
+      text: "The most important safety part on the MCU side. GPIO18 turns it on with SSR1. The 1 Ω resistor eats the C_block inrush (Q = C·ΔV ≈ 936 µF × 20 V ≈ 18.7 mC); BAT54S only catches residual spikes.",
       facts: { GPIO: "GPIO18 (wired with SSR1)", Series: "1 Ω", Job: "Hold V_cap at GND while pre-charging" },
       note: "Never enable SSR1 unless SSR3 is already on. Shared GPIO18 is the hardware AND of that rule.",
     },
@@ -192,20 +192,20 @@
       chips: ["analog"],
       bom: "1 × 1 Ω",
       why: "Gives C_block somewhere to dump charge besides the Schottky clamp and the ESP32 bond wires.",
-      text: "Energy ½CV² = ½ × 0.001 × 400 = 0.2 J from 1000 µF at 20 V. A pulse-rated part is appropriate.",
-      facts: { Value: "1 Ω", Energy: "0.2 J from 1000 µF @ 20 V" },
+      text: "Energy ½CV² = ½ × 936e-6 × 400 ≈ 0.19 J from 936 µF at 20 V. A pulse-rated part is appropriate.",
+      facts: { Value: "1 Ω", Energy: "0.19 J from 936 µF @ 20 V" },
     },
-    r100: { name: "100 Ω range", kind: "Timing resistor", loc: "MAX4619 CH2 → V_cap", chips: ["analog"], bom: "1 × 100 Ω, 1 %", why: "Needed for hundreds of µF so the step settles in milliseconds, not seconds.", text: "Buffer Zo plus mux Ron are a large fraction of this range, so R_eff is calibrated. Peak drive 3.3 V / 100 Ω ≈ 33 mA — why the buffer exists.", facts: { Value: "100 Ω", "Mux ch": "CH2", "Best C": "50 µF – 1000 µF" } },
-    r1k: { name: "1 kΩ range", kind: "Timing resistor", loc: "MAX4619 CH1 → V_cap", chips: ["analog"], bom: "1 × 1 kΩ, 1 %", why: "Brings large nF / small µF into a millisecond RC-step window.", text: "Mid range. R_eff calibrated because it too is a large fraction of R_nom.", facts: { Value: "1 kΩ", "Mux ch": "CH1", "Best C": "100 nF – 50 µF" } },
-    r100k: { name: "100 kΩ range", kind: "Timing resistor", loc: "MAX4619 CH0 → V_cap", chips: ["analog"], bom: "1 × 100 kΩ, 1 %", why: "Long RC for small capacitors so the oscillator frequency stays in the comfort band.", text: "Primary oscillator range for pF–nF. A bare node runs fast; the ISR rate limiter protects the core.", facts: { Value: "100 kΩ", "Mux ch": "CH0", "Best C": "pF – 100 nF" } },
-    r1m: { name: "1 MΩ range", kind: "Timing resistor", loc: "MAX4619 CH3 → V_cap", chips: ["analog"], bom: "1 × 1 MΩ, 1 %", why: "Highest sensitivity for the smallest ceramics; the range where the ~136 pF node parasitic matters most.", text: "Tared (T0) so the parasitic capacitance is removed mathematically. ADC is hard-gated off below 1 nF.", facts: { Value: "1 MΩ", "Mux ch": "CH3", "Best C": "sub-nF – 10 nF" } },
+    r100: { name: "100 Ω range", kind: "Timing resistor", loc: "MAX4619 CH2 → V_cap", chips: ["analog"], bom: "1 × 98.9 Ω (100 Ω nom.), 1 %", why: "Needed for hundreds of µF so the step settles in milliseconds, not seconds.", text: "Buffer Zo plus mux Ron are a large fraction of this range, so R_eff is calibrated. Peak drive 3.3 V / 100 Ω ≈ 33 mA — why the buffer exists.", facts: { Value: "98.9 Ω (measured)", "Mux ch": "CH2", "Best C": "50 µF – 1000 µF" } },
+    r1k: { name: "1 kΩ range", kind: "Timing resistor", loc: "MAX4619 CH1 → V_cap", chips: ["analog"], bom: "1 × 993.6 Ω (1 kΩ nom.), 1 %", why: "Brings large nF / small µF into a millisecond RC-step window.", text: "Mid range. R_eff calibrated because it too is a large fraction of R_nom.", facts: { Value: "993.6 Ω (measured)", "Mux ch": "CH1", "Best C": "100 nF – 50 µF" } },
+    r100k: { name: "100 kΩ range", kind: "Timing resistor", loc: "MAX4619 CH0 → V_cap", chips: ["analog"], bom: "1 × 98.6 kΩ (100 kΩ nom.), 1 %", why: "Long RC for small capacitors so the oscillator frequency stays in the comfort band.", text: "Primary oscillator range for pF–nF. A bare node runs fast; the ISR rate limiter protects the core.", facts: { Value: "98.6 kΩ (measured)", "Mux ch": "CH0", "Best C": "pF – 100 nF" } },
+    r1m: { name: "1 MΩ range", kind: "Timing resistor", loc: "MAX4619 CH3 → V_cap", chips: ["analog"], bom: "1 × 1.01 MΩ (1 MΩ nom.), 1 %", why: "Highest sensitivity for the smallest ceramics; the range where the ~136 pF node parasitic matters most.", text: "Tared (T0) so the parasitic capacitance is removed mathematically. ADC is hard-gated off below 1 nF.", facts: { Value: "1.01 MΩ (measured)", "Mux ch": "CH3", "Best C": "sub-nF – 10 nF" } },
     refdiv: { name: "LM393 reference divider", kind: "1.65 V midpoint", loc: "3.3 V → 10 kΩ/10 kΩ → GND", chips: ["analog"], bom: "2 × 10 kΩ", why: "Sets the comparator threshold at half the 3.3 V rail.", text: "The LM393 inverting input sits at 1.65 V, centred for symmetric rising/falling thresholds.", facts: { Value: "10 kΩ / 10 kΩ", Node: "1.65 V" } },
     rhyst: { name: "100 kΩ hysteresis", kind: "Positive feedback", loc: "LM393 output → IN+", chips: ["analog"], bom: "1 × 100 kΩ", why: "Without hysteresis the comparator would chatter on slow edges.", text: "Positive feedback widens the threshold band so the comparator gives one clean transition per RC crossing.", facts: { Value: "100 kΩ", Role: "Schmitt hysteresis" } },
     rpull: { name: "10 kΩ pull-up", kind: "Open-collector load", loc: "LM393 output → 3.3 V", chips: ["analog"], bom: "1 × 10 kΩ", why: "The LM393 output is open-collector and needs a defined high level.", text: "Pulls the output to 3.3 V so GPIO14 sees a clean logic swing.", facts: { Value: "10 kΩ", Role: "Output pull-up" } },
     r330: { name: "330 Ω LED limit", kind: "PhotoMOS input", loc: "GPIO12 / GPIO18 → SSR LEDs", chips: ["mcu"], bom: "3 × 330 Ω", why: "AQY212 LED is ~1.2 V, 5–10 mA. From 3.3 V, 330 Ω gives ≈ 6.4 mA.", text: "One per SSR. Keep them next to the MCU, not next to the high-voltage output pins.", facts: { Value: "330 Ω × 3", "I_LED": "≈ 6.4 mA" } },
     vcap: { name: "V_cap node", kind: "MCU-side analog", loc: "After C_block", chips: ["analog", "mcu"], bom: "Net", why: "The only analog voltage the ESP32 is allowed to touch.", text: "Held between GND and 3.3 V by BAT54S, forcibly grounded by SSR3 during pre-charge, driven through the range resistors during measurement, watched by GPIO10 and the LM393.", facts: { Clamps: "BAT54S + SSR3", Senses: "GPIO10, GPIO14", Drive: "range resistor bank" } },
     ndut: { name: "N_DUT node", kind: "High-voltage analog", loc: "Top of C_DUT", chips: ["hv"], bom: "Net", why: "Meeting point of bias, pre-charge, discharge and the DUT.", text: "This node can sit at up to 20 V. Isolated from V_cap by C_block. Never probe it with the ESP32.", facts: { Connections: "R_bias, SSR1, SSR2, C_DUT, C_block" } },
-    vbias: { name: "V_BIAS rail", kind: "External 0–20 V", loc: "Bias input", chips: ["hv"], bom: "Net", why: "A quiet DC source for C-V / derating tests, isolated from logic by C_block.", text: "Feeds R_bias and the SSR1 pre-charge branch. Never connects to the ESP32 except across C_block (AC).", facts: { Range: "0 – 20 V", Isolation: "C_block 1000 µF", Control: "external supply" } },
+    vbias: { name: "V_BIAS rail", kind: "External 0–20 V", loc: "Bias input", chips: ["hv"], bom: "Net", why: "A quiet DC source for C-V / derating tests, isolated from logic by C_block.", text: "Feeds R_bias and the SSR1 pre-charge branch. Never connects to the ESP32 except across C_block (AC).", facts: { Range: "0 – 20 V", Isolation: "C_block 936 µF", Control: "external supply" } },
     probe: { name: "PROBE phase", kind: "Pipeline · phase 1", loc: "Remembered range", chips: ["mcu"], bom: "Firmware (no extra part)", why: "A fast oscillator reading on the previously used range gives a rough capacitance to plan the sweep, without a full sweep first.", text: "One quick LM393 oscillator measurement. Its result decides which ADC ranges are worth trying and which oscillator range is closest to the 2 kHz sweet spot.", facts: { Method: "OSC, single range", Output: "rough C", Cost: "one short measurement" } },
     sweep: { name: "SWEEP phase", kind: "Pipeline · phase 2", loc: "ADC + oscillator ranges", chips: ["mcu", "analog"], bom: "Firmware (no extra part)", why: "Collects many independent samples so fusion has something to trust.", text: "Runs the ADC τ-measurement on every range whose predicted τ lands in 250 µs–4 s, plus an oscillator run on the range whose predicted frequency is closest to 2 kHz.", facts: { ADC: "250 µs ≤ τ ≤ 4 s", OSC: "100 Hz ≤ f ≤ 15 kHz", "OSC sweet spot": "2000 Hz" } },
     fuse: { name: "FUSION phase", kind: "Pipeline · phase 3", loc: "Result", chips: ["mcu"], bom: "Firmware (no extra part)", why: "Turns many noisy samples into one robust estimate.", text: "Weights every sample by its physics-based quality, drops those outside ±87.5 % of the median, takes a log-domain weighted average, and flags ADC-vs-oscillator disagreement beyond a 1.5× ratio.", facts: { Gate: "±87.5 % of median", Mean: "log-domain, weighted", Mismatch: "ratio > 1.5 warns" } },
@@ -216,7 +216,7 @@
     { id: "lm393", tag: "SENSE", title: "LM393", text: "1.65 V midpoint + hysteresis. Hardware-in-the-loop oscillator." },
     { id: "buf", tag: "DRIVE", title: "Buffer", text: "SN74LVC1G34 gives sharp, low-impedance 3.3 V steps." },
     { id: "mux", tag: "RANGE", title: "MAX4619", text: "Buffered 4:1 mux → 100 Ω / 1 kΩ / 100 kΩ / 1 MΩ." },
-    { id: "cblock", tag: "ISO", title: "C_block", text: "1000 µF ∥ 100 nF. DC bias dies here. Measurement AC passes." },
+    { id: "cblock", tag: "ISO", title: "C_block", text: "936 µF ∥ 67.8 nF. DC bias dies here. Measurement AC passes." },
     { id: "ssr1", tag: "SAFE", title: "PhotoMOS bank", text: "Pre-charge, discharge and clamp. GPIO18 is the interlock." },
   ];
 
@@ -226,14 +226,14 @@
     ["1", "Logic buffer", "SN74LVC1G34", "Push-pull 3.3 V step excitation driver", "buf"],
     ["1", "Analog mux", "MAX4619", "4:1 low-leakage range select (A0/A1)", "mux"],
     ["1", "Schottky array", "BAT54S", "Clamps V_cap to GND / 3.3 V", "bat54s"],
-    ["1", "Electrolytic", "1000 µF / ≥25 V", "C_block, isolates MCU from the 0–20 V bias", "cblock"],
-    ["1", "Ceramic", "100 nF / ≥25 V", "HF bypass across C_block", "cnf"],
+    ["1", "Electrolytic", "936 µF (1000 µF nom.) / ≥25 V", "C_block, isolates MCU from the 0–20 V bias", "cblock"],
+    ["1", "Ceramic", "67.8 nF (100 nF nom.) / ≥25 V", "HF bypass across C_block", "cnf"],
     ["3", "PhotoMOS SSR", "AQY212 / TLP241A", "S1 pre-charge, S2 discharge, S3 V_cap clamp", "ssr1"],
-    ["1", "Resistor 1%", "1 MΩ", "R_bias high-Z DC bias injection", "rbias"],
-    ["1", "Resistor 1%", "100 Ω", "Range 0 (MAX4619 CH2)", "r100"],
-    ["1", "Resistor 1%", "1 kΩ", "Range 1 (MAX4619 CH1)", "r1k"],
-    ["1", "Resistor 1%", "100 kΩ", "Range 2 (MAX4619 CH0)", "r100k"],
-    ["1", "Resistor 1%", "1 MΩ", "Range 3 (MAX4619 CH3)", "r1m"],
+    ["1", "Resistor 1%", "4.8 MΩ (4.7 MΩ nom.)", "R_bias high-Z DC bias injection", "rbias"],
+    ["1", "Resistor 1%", "98.9 Ω (100 Ω nom.)", "Range 0 (MAX4619 CH2)", "r100"],
+    ["1", "Resistor 1%", "993.6 Ω (1 kΩ nom.)", "Range 1 (MAX4619 CH1)", "r1k"],
+    ["1", "Resistor 1%", "98.6 kΩ (100 kΩ nom.)", "Range 2 (MAX4619 CH0)", "r100k"],
+    ["1", "Resistor 1%", "1.01 MΩ (1 MΩ nom.)", "Range 3 (MAX4619 CH3)", "r1m"],
     ["1", "Resistor", "10 Ω", "SSR1 pre-charge inrush limit", "rpre"],
     ["1", "Resistor", "100 Ω", "SSR2 discharge bleed", "rdis"],
     ["1", "Resistor", "1 Ω", "SSR3 V_cap clamp inrush absorber", "rclamp"],
@@ -261,8 +261,8 @@
     { sheet: "sys", sel: "mux", text: "A MAX4619 4:1 mux picks one of four range resistors. Auto-ranging is just two address bits: GPIO4 and GPIO5." },
     { sheet: "sys", sel: "vcap", text: "V_cap is the only analog node the ESP32 touches. It is read by GPIO10, watched by the LM393, and clamped by BAT54S and SSR3." },
     { sheet: "sys", sel: "lm393", text: "In oscillator mode the LM393 fires on V_cap; the ESP32 ISR mirrors its output back onto the buffer. That closes a hardware-in-the-loop relaxation oscillator." },
-    { sheet: "sys", sel: "cblock", text: "C_block is the galvanic wall: 1000 µF ∥ 100 nF. The 0–20 V bias stays on N_DUT; only the measurement AC crosses to V_cap." },
-    { sheet: "sys", sel: "rbias", text: "R_bias (1 MΩ) holds N_DUT at the bias voltage. Stiff for DC, but far too large to disturb the AC measurement." },
+    { sheet: "sys", sel: "cblock", text: "C_block is the galvanic wall: 936 µF ∥ 67.8 nF. The 0–20 V bias stays on N_DUT; only the measurement AC crosses to V_cap." },
+    { sheet: "sys", sel: "rbias", text: "R_bias (4.8 MΩ) holds N_DUT at the bias voltage. Stiff for DC, but far too large to disturb the AC measurement." },
     { sheet: "front", sel: "ssr3", text: "SSR3 is the interlock. Same GPIO18 as SSR1. It holds V_cap at GND through 1 Ω so C_block inrush never reaches GPIO10/GPIO14." },
     { sheet: "front", sel: "r1m", text: "The 1 MΩ range is where sensitivity is highest and the ~136 pF board parasitic dominates. A measured tare (T0) removes it mathematically." },
     { sheet: "front", sel: "r100", text: "The 100 Ω range charges microfarads quickly. Buffer Zo plus mux Ron are a big fraction of it, so R_eff is calibrated per range." },
@@ -441,7 +441,7 @@
     const g4 = box(S.fg, "rbank", 620, 380, 170, 110, "Range bank", "R_range");
     txt(g4, 632, 470, "100 Ω · 1 kΩ · 100 kΩ · 1 MΩ", "pin-lbl");
     box(S.fg, "vcap", 820, 380, 180, 110, "V_cap", "0–3.3 V · safe");
-    box(S.fg, "cblock", 1030, 380, 160, 110, "C_block", "1000 µF ∥ 100 nF");
+    box(S.fg, "cblock", 1030, 380, 160, 110, "C_block", "936 µF ∥ 67.8 nF");
     box(S.fg, "ndut", 1220, 380, 140, 110, "N_DUT", "0–20 V");
     box(S.fg, "cdut", 1390, 380, 140, 110, "C_DUT", "unknown");
 
@@ -470,7 +470,7 @@
     dot(S.fg, 1000, 380);
 
     /* R_bias */
-    const rb = box(S.fg, "rbias", 1130, 275, 200, 64, "1 MΩ R_bias", "DC in · AC open");
+    const rb = box(S.fg, "rbias", 1130, 275, 200, 64, "4.8 MΩ R_bias", "DC in · AC open");
     wire(S.bg, "M1230 100 V275", "hv", "vbias");
     wire(S.bg, "M1230 339 V380", "hv", "ndut");
     dot(S.fg, 1230, 100);
@@ -507,12 +507,12 @@
     txt(S.fg, 545, 165, "N_DUT", "rail-lbl");
 
     /* R_bias */
-    resHV(S.fg, "rbias", 470, 90, 120, "1 MΩ", true);
+    resHV(S.fg, "rbias", 470, 90, 120, "4.8 MΩ", true);
     wire(S.bg, "M470 90 H520 V90", "hv");
     dot(S.fg, 470, 90);
     wire(S.bg, "M470 210 V150 H520", "hv", "ndut");
     dot(S.fg, 520, 150);
-    txt(S.fg, 388, 130, "R_bias 1 MΩ", "pin-lbl");
+    txt(S.fg, 388, 130, "R_bias 4.8 MΩ", "pin-lbl");
 
     /* SSR1 pre-charge */
     ssr4(S.fg, "ssr1", 150, 100, "SSR1 PRE-CHARGE", "GPIO18");
@@ -542,8 +542,8 @@
     /* C_block + HF bypass */
     capH(S.fg, "cblock", 560, 430, "");
     capH(S.fg, "cnf", 560, 350, "");
-    txt(S.fg, 610, 356, "100 nF", "lbl-sm");
-    txt(S.fg, 610, 452, "1000 µF", "lbl-sm");
+    txt(S.fg, 610, 356, "67.8 nF", "lbl-sm");
+    txt(S.fg, 610, 452, "936 µF", "lbl-sm");
     txt(S.fg, 596, 336, "C_block", "box-sub");
     wire(S.bg, "M520 430 H560", "analog", "ndut");
     wire(S.bg, "M520 430 V350 H560", "analog");
@@ -682,7 +682,7 @@
     txt(S.fg, 40, 648, "• ADC tried only when predicted τ ≥ 250 µs and ≤ 4 s; skipped entirely below 1 nF (oscillator owns sub-nF).", "note");
     txt(S.fg, 40, 670, "• Oscillator accepted for 100 Hz ≤ f ≤ 15 kHz; the ISR rate-limits edges faster than ~166 kHz so a fast range can never saturate the core.", "note");
     txt(S.fg, 40, 692, "• If the fastest range saturates, retry on 100 kΩ; a linear hunt falls back from 1 MΩ downward when the probe fails.", "note");
-    txt(S.fg, 40, 714, "• Larger DUTs: C_eq is the series combination with C_block (1000 µF) — invert first, then subtract parallel stray.", "note");
+    txt(S.fg, 40, 714, "• Larger DUTs: C_eq is the series combination with C_block (936 µF) — invert first, then subtract parallel stray.", "note");
     txt(S.fg, 40, 748, "Firmware owns all of this; the dashboard just displays the fused value, spread and per-sample breakdown.", "note");
     return S.svg;
   }
@@ -900,7 +900,7 @@
     ["RC step", "V(t) = V_inf (1 − e^(−t/τ))", "Fit the rising exponential; the slope of ln(V_inf − V) is −1/τ. Then τ = R_eff·C_eq."],
     ["Per-range asymptote", "R_leak = V_inf·R / (V_nom − V_inf)", "R_bias and leakage pull V_inf below 3.3 V; it is measured per range and R_leak is folded into R_eff."],
     ["Oscillator model", "T = K·R·C_dut + T0", "K is a dimensionless geometry constant, T0 a measured per-range offset. Both are solved by calibration and stored in NVS."],
-    ["C_block series", "C_eq = C_b·C_d / (C_b + C_d)", "Above 1 µF, invert the 1000 µF series combination first, then subtract parallel stray C."],
+    ["C_block series", "C_eq = C_b·C_d / (C_b + C_d)", "Above 1 µF, invert the 936 µF series combination first, then subtract parallel stray C."],
     ["ADC quality", "q = q_time·q_stray·q_range·q_fit", "Each sample is scored by how well the physics assumptions hold, not by a single confidence flag."],
     ["Fusion", "C = exp( Σ w ln C / Σ w )", "Median-gate outliers, then a quality-weighted geometric mean across every surviving (range, method) sample."],
   ].map(([h, f, t]) => `<div class="panel card"><span class="br"></span><span class="bl"></span><h3>${h}</h3><div class="formula">${f}</div><p>${t}</p></div>`).join("");
@@ -933,7 +933,7 @@
   $("#fsm").innerHTML = [
     "IDLE — all SSRs off, range mux idle, drive low. DUT may be inserted. The device boots here.",
     "PRE-CHARGE — GPIO18 on: SSR3 clamps V_cap through 1 Ω while SSR1 charges N_DUT through 10 Ω. Hold 1000 ms. Bias already set.",
-    "ISOLATE — GPIO18 off. N_DUT stays at bias through R_bias (1 MΩ). V_cap is free; BAT54S still watching.",
+    "ISOLATE — GPIO18 off. N_DUT stays at bias through R_bias (4.8 MΩ). V_cap is free; BAT54S still watching.",
     "RANGE — set A0/A1 (GPIO4/5). PROBE on the remembered range, then SWEEP the in-window ADC ranges + the best oscillator range.",
     "MEASURE OSC — GPIO14 ISR mirrors the LM393 onto GPIO16; average 50 periods, then C_eq = (T − T0)/(K·R).",
     "MEASURE ADC — hold GPIO16 high; sample V_cap on GPIO10, fit the exponential, τ = R_eff·C_eq.",
