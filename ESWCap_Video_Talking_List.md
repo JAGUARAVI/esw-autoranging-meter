@@ -56,11 +56,11 @@
 **Visual:** Problem slide — three bullets + a "range vs accuracy" gap graphic.
 
 **Voice-over:**
-- "Measuring capacitance accurately is hard because the usable range is enormous."
-- "Small capacitors — picofarads — need very high resistance and very fine timing; large capacitors — hundreds of microfarads — need low resistance and long timing."
-- "A single range or a single measurement method simply cannot cover both well."
-- "Low-resistance ranges time out on big caps, and high-resistance ranges are swamped by the board's own parasitic capacitance — around 136 picofarads on our board."
-- "So the challenge: one instrument, one measurement, accurate across the whole range."
+- "In our lab we calibrate MQ-type gas sensors, and that needs a meter that can measure capacitance and resistance under a DC bias."
+- "The standard tool is an LCR meter — lab-grade units cost over twenty thousand rupees, which is too much for routine student work."
+- "The measurement range is also enormous: picofarads need very high resistance and fine timing, hundreds of microfarads need low resistance and long timing."
+- "No single range or method covers both, and high-resistance ranges are swamped by the board's own parasitic capacitance — around 136 picofarads on our board."
+- "So the challenge: a cheap, single instrument, accurate across the whole range, under bias."
 
 **Do NOT:** Don't claim a numeric accuracy spec (not recorded).
 
@@ -71,10 +71,10 @@
 **Visual:** Motivation slide — why it matters + design goals.
 
 **Voice-over:**
-- "Component testers and multimeters either don't measure capacitance, or only measure a narrow band."
-- "We wanted a lab-grade, self-calibrating meter that a student can use without setting switches by hand."
-- "Our goals: automatic range selection, automatic method selection, self-calibration stored on the device, and a live readout for the operator."
-- "That led to a hybrid design: an ADC charge-timing path for larger capacitors, and an oscillator path for small ones."
+- "We needed a substitute for a twenty-thousand-rupee LCR meter that a student can actually afford and automate."
+- "So we built a lab-grade, self-calibrating meter that runs without setting switches by hand."
+- "Our goals: automatic range selection, automatic method selection, calibration stored on the device, DC bias for real sensors, and a live readout."
+- "That led to a hybrid design — an ADC charge-timing path for larger capacitors and an oscillator path for small ones — with a resistance-measurement path in development for full MQ-sensor calibration."
 
 **Do NOT:** No war stories about bugs (cause→fix only, later).
 
@@ -228,6 +228,7 @@
 - "We'll profile interrupt latency and consider offloading the oscillator feedback to hardware for the smallest capacitors."
 - "We'll verify the ADC curve-fit calibration near the top of its range."
 - "And we'll check for leakage through the pull-up and protection diodes during the soak phase."
+- "We're also adding a resistance-measurement path so the same meter fully calibrates MQ gas sensors."
 - "Longer term: an enclosure and an on-board display."
 
 **Do NOT:** Don't imply any of these are done.
@@ -257,6 +258,7 @@
 
 ## Viva prep quick answers
 
+- **Why build it at all?** To replace a 20k+ INR LCR meter with a cheap, bias-capable, scriptable meter for calibrating MQ-type gas sensors.
 - **Why two methods?** Neither covers pF–µF alone: ADC τ is accurate for large caps, the tared oscillator for small ones.
 - **Why is the LM393 a "comparator oscillator"?** It has hysteresis only; the ESP32 ISR mirrors its output back to the drive buffer, closing the loop in software.
 - **Why tare?** To remove the ~136 pF board parasitic and fixed latency via a measured T-zero.

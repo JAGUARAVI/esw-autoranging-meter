@@ -44,7 +44,8 @@
 | --- | --- | --- |
 | Name | ESWCap — ESP32-S3 Autoranging Capacitance Meter (Multi-Range / Multi-Method Fusion) | CONFIRMED |
 | One-line description | A capacitance meter that treats every (range, method) pair as an independent sensor, scores each sample with a physics-based quality metric, and fuses all plausible samples into one high-confidence estimate. | CONFIRMED |
-| Problem it solves | Accurately measuring capacitance over a very wide range (pF to hundreds of µF) where no single range or method is accurate everywhere. | CONFIRMED |
+| Problem it solves | Accurately measuring capacitance (and, in development, resistance) over a very wide range (pF to hundreds of µF) where no single range or method is accurate everywhere — without spending 20k+ INR on a lab LCR meter. | CONFIRMED |
+| Motivation / application | Calibrating and measuring MQ-type gas sensors in the lab, under DC bias; a low-cost, bias-capable, scriptable replacement for an expensive LCR meter. | CONFIRMED |
 | Core idea | Hybrid measurement: ADC RC-charge-timing (τ) for larger capacitors + LM393 hardware-in-the-loop relaxation oscillator for small capacitors; automatic range/method selection; weighted fusion. | CONFIRMED |
 | Original platform | STM32G431CBU6 (replaced by ESP32) | CONFIRMED (excluded from deck by user choice #8) |
 | Current platform | ESP32-S3 (Freenove ESP32-S3 WROOM), ESP-IDF framework | CONFIRMED |
@@ -56,6 +57,7 @@
 | Spec | Value | Status |
 | --- | --- | --- |
 | Range resistors | `100 Ω`, `1 kΩ`, `100 kΩ`, `1 MΩ` | CONFIRMED |
+| Resistance measurement | LCR-style resistance path for MQ gas-sensor calibration; in development (not yet validated) | PARTIAL — in progress |
 | Number of ranges | 4 (`RANGE_COUNT = 4`) | CONFIRMED |
 | ADC channel | ADC1 `ADC_CHANNEL_9`, on `GPIO10` | CONFIRMED |
 | ADC attenuation | `ADC_ATTEN_DB_12` (≈ 0–3.3 V input span) | CONFIRMED |
@@ -334,6 +336,7 @@ Not available. Component list (see §2.3) exists, but no prices, quantities, or 
 - Verify ADC curve-fitting near the 2085 mV threshold — PLANNED.
 - Leakage-current check on the pull-up and BAT54S — PLANNED.
 - Enclosure, display, and cost analysis — Not discussed.
+- Add an LCR-style **resistance-measurement path** so the same instrument fully calibrates MQ-type gas sensors (resistance + capacitance under bias) — IN DEVELOPMENT.
 
 ### 2.15 Assets (files that exist)
 
@@ -398,10 +401,10 @@ Each slide lists Purpose, Content (referencing Part 2 sections), Visual, Speaker
 
 **Slide 2 — Teaser / what it does (hero)**
 - **Purpose:** Hook the examiners with the end result in one glance.
-- **Content:** A wide capacitance range (pF → hundreds of µF), hybrid ADC+oscillator approach, live dashboard (§2.1, §2.6, §2.8).
+- **Content:** A wide capacitance range (pF → hundreds of µF), hybrid ADC+oscillator approach, live dashboard, and the motivation: calibrate MQ-type gas sensors under bias without a 20k+ INR LCR meter (§2.1, §2.6, §2.8).
 - **Visual:** Dashboard screenshot (asset: `host/static/index.html` render — must be captured) or a large live readout.
-- **Speaker notes:** "One meter, two physics-based methods, automatically fused."
-- **What NOT:** Don't claim unverified precision; don't show code.
+- **Speaker notes:** "We replaced a 20k+ INR LCR meter with one cheap instrument that measures under bias — two physics-based methods, automatically fused."
+- **What NOT:** Don't claim unverified precision; don't show code; don't detail our own BOM cost.
 
 **Slide 3 — System overview / block diagram**
 - **Purpose:** Show the full signal chain at a conceptual level.
@@ -482,7 +485,7 @@ Each slide lists Purpose, Content (referencing Part 2 sections), Visual, Speaker
 
 **Slide 14 — Future work**
 - **Purpose:** Show the roadmap.
-- **Content:** Two-point calibration with 1% C0G/NP0 (`100 pF`, `1 nF`); ISR latency profiling / hardware-gate offload; ADC curve-fit verification; leakage check; enclosure/display (§2.14).
+- **Content:** Two-point calibration with 1% C0G/NP0 (`100 pF`, `1 nF`); ISR latency profiling / hardware-gate offload; ADC curve-fit verification; leakage check; resistance-measurement path for MQ gas sensors; enclosure/display (§2.14).
 - **Visual:** Simple roadmap or checklist.
 - **Speaker notes:** Emphasize these are the honest next steps.
 - **What NOT:** Don't imply any are already complete.
