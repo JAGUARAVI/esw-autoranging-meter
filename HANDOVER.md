@@ -91,6 +91,25 @@ the oscillator tare), `adccal1 <pF>` then `adccal2 <pF>` (two-point, solves
 the exact runtime path (`measure_adc_range`), and `s.tau_us` now holds the true
 effective τ (fallback-corrected) so calibration and measurement stay consistent.
 
+**ADC τ estimator (voltage-domain nonlinear fit).** τ is no longer extracted by
+linearising `ln(V_inf − V)` and taking the OLS slope. That assumed the asymptote
+`V_inf` was known exactly, but `V_inf` comes from a coarse settle loop and τ is
+very sensitive to its error (a ~60 mV asymptote bias produced ~−7 % τ error in
+the synthetic model). `measure_adc_range()` now fits the curve in the *voltage*
+domain, solving `V_inf` jointly with τ and the effective origin `t0` via a damped
+Gauss–Newton (Levenberg–Marquardt) fit of
+`V(t) = V_inf − (V_inf − V0)·e^(−(t−t0)/τ)`, with `V0` sampled at the step edge.
+The fitted `V_inf` is fed back into the per-range asymptote cache (it is a better
+estimate than the settle loop), the capture window extends to 90 % of `V_inf`,
+and the 100 kΩ / 1 MΩ ranges oversample 4× per stored point to beat down ADC
+noise. Goodness of fit is reported in the voltage domain (RMSE) and the τ
+standard error from the fit covariance down-weights poorly-constrained samples in
+the quality score. `@EVT curve` now also carries `v0`/`t0_us` so the dashboard
+ghost line renders the exact fitted model; `@EVT sample` carries `rmse_mv` and
+`tau_unc_us`. `host/fit_analysis.py` reproduces both estimators offline: on
+synthetic curves with a biased asymptote the new fit is ~0 % biased / ~0.25 %
+spread versus ~−7 % / ~4.5 % for the old one, and it can replay saved recordings.
+
 **Tare must use the measurement path.** `dbg_tare` and `dbg_capture_point`
 previously measured the period with `dbg_measure_freq()` (a 20 ms PCNT gate),
 while `measure_osc_range()` uses `osc_measure_frequency()` (quick PCNT, then a
@@ -176,27 +195,46 @@ live front-panel indicator for the bench and the demo:
 | State | LED |
 | --- | --- |
 | boot | R → G → B flourish, then live |
-| IDLE (all off, safe to touch) | calm blue breathe |
+| IDLE, discharged (safe to touch) | calm blue breathe |
 | PRE-CHARGE | amber pulse |
-| ISOLATE / biased (`FE_PRECHARGED`) | **steady red** — do not touch the DUT |
+| ISOLATE / biased (`FE_PRECHARGED`, incl. after a stop) | **steady red** — do not touch the DUT |
 | MEASURING | breathes the **active range colour** (100 Ω red, 1 kΩ amber, 100 kΩ blue, 1 MΩ green — same tokens as the dashboard) |
 | DISCHARGE | green pulse |
 | after each cycle | 300 ms flash: green (clean) / amber (low confidence or ADC–OSC mismatch) / red (cycle rejected) |
 | FAULT (reserved) | red blink |
 
+**Persistent node charge state.** "All SSRs off" does *not* mean discharged: with
+SSR2 off the DUT/C_block stay at `V_BIAS` through `R_bias`. So the charge state is
+tracked independently of the momentary phase (`g_fe_charged` / `g_fe_discharged`)
+and reported in `@@EVT fe` both as booleans and as a single `"charge"` string
+(`"charged"` / `"discharged"` / `"unknown"`). `front_end_finish()` now ends in
+`FE_PRECHARGED` (not `FE_IDLE`) when the node is still charged and auto-discharge
+is OFF, so **a stop keeps reporting "charged"** and the LED stays **red** until an
+explicit `discharge`. An explicit `discharge` (or auto-discharge) sets
+`charge=discharged` and returns the LED to blue.
+
 `led auto` restores state animation, `led off` blanks it, and `led <r> <g> <b>`
 holds a fixed colour for a demo. Build-time overrides:
 `-DSTATUS_LED_GPIO=<n>` and `-DSTATUS_LED_ENABLE=0`.
 
-Driver notes (do not regress): the WS2812 frame is 25 RMT symbols, so
-`mem_block_symbols = 64` is used to get 48-symbol ping-pong halves — the frame
-then completes with only the final TX-done event, no mid-frame threshold
-interrupt. The channel is created with `intr_priority = 3` so a fast LM393
-oscillator (edge ISR at up to ~166 kHz) cannot starve RMT completion, and the
-animation task is **non-blocking**: it advances only when the previous frame's
-`on_trans_done` callback has fired (with a 250 ms watchdog), never calling
-`rmt_tx_wait_all_done()`. Blocking on that wait from the LED task caused
-`rmt: rmt_tx_wait_all_done(): flush timeout` spam during oscillator measurements.
+Driver notes (do not regress):
+- The WS2812 frame is 25 RMT symbols; `mem_block_symbols = 64` gives 48-symbol
+  ping-pong halves, so the frame completes with only the final TX-done event and
+  no mid-frame threshold interrupt.
+- The animation task is **non-blocking**: it starts a frame only when the
+  previous frame's `on_trans_done` callback has fired, otherwise it holds the
+  last colour. It never calls `rmt_tx_wait_all_done()` (that produced
+  `rmt: ... flush timeout` spam) and never queues a second frame while one is in
+  flight (`trans_queue_depth = 1`).
+- The transmit buffer is a static `rmt_symbol_word_t[25]`, **not** a stack
+  buffer, so a queued transaction can never read a stale stack frame.
+- Leave `intr_priority = 0` (auto). Forcing RMT to level 3 preempted the
+  FreeRTOS tick and starved IDLE0, tripping the task watchdog
+  (`task_wdt: IDLE0 did not reset ... CPU 0: status_led`).
+- **The LED task is pinned to core 1** (`xTaskCreatePinnedToCore(..., 1)`), and
+  `rmt_new_tx_channel()` is called from *inside* that task so the RMT interrupt
+  is also allocated on core 1.  The whole LED subsystem is therefore off CPU 0
+  and cannot starve the measurement task, the FreeRTOS tick or IDLE0.
 
 ## 6. Pending Action Items & Validation Required
 
@@ -204,5 +242,12 @@ animation task is **non-blocking**: it advances only when the previous frame's
   described in §4 with 1% C0G/NP0 references (e.g. 100 pF, 1 nF) to set the
   real geometry constant `K` and offset `T0`.
 * **ISR Latency Profiling:** The ESP32 FreeRTOS ISR has higher latency than a bare-metal STM32 interrupt. If the loop delay introduces significant non-linearity at sub-100 pF ranges, the feedback loop may need to be offloaded entirely to a hardware gate (e.g., routing the LM393 output directly into the SN74LVC1G34 buffer via a digital switch).
-* **ADC Curve Fitting Verification:** The code utilizes `esp_adc_cali_scheme_curve_fitting`. Verify that the ESP32-eFuse calibration values correctly map the non-linear high end of the ADC curve near the 2085 mV threshold.
+* **ADC Curve Fitting Verification:** The τ fit is now a voltage-domain nonlinear
+  least-squares (see §4), which removes the old sensitivity to the eFuse/asymptote
+  estimate. The remaining item is the `esp_adc_cali_scheme_curve_fitting` raw→mV
+  mapping itself: confirm the eFuse curve is accurate near the top of the window
+  (the ESP32 ADC is nonlinear above ~2.45 V) and, if not, add a per-board
+  gain/offset correction on top of it. Continuous-DMA ADC acquisition (fixed
+  sample rate, hardware timestamps) is the next timing-accuracy step and is still
+  to be implemented.
 * **Leakage Current Check:** Validate that the 10 kΩ pull-up on the LM393 and the BAT54S leakage do not bleed charge into the RC node during the 600 ms dielectric soak phase.

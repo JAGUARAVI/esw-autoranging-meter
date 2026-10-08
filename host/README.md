@@ -42,7 +42,7 @@ Every chart is fed only by real firmware telemetry — nothing is synthesised.
 | Sample spread | `cycle` | `spread` |
 | Oscillator frequency per range | `sample` (osc) | `freq` |
 | ADC τ per range | `sample` (adc) | `tau_us` |
-| ADC charge curve + fitted exp | `curve` | `pts`, `vinf`, `tau_us`, `r2` (backend stores the latest; a reconnecting client is handed it) |
+| ADC charge curve + fitted exp | `curve` | `pts`, `vinf`, `v0`, `t0_us`, `tau_us`, `r2` (backend stores the latest; a reconnecting client is handed it). The ghost line renders the exact firmware model `V(t)=Vinf−(Vinf−V0)·exp(−(t−t0)/τ)`. |
 | Calibration T vs C_ref | `calpt` / `calres` | `ref_pf`, `period_us`, `k`, `t0_us` |
 | Tare stability (T0 per range) | `tare` | `period_us`, `t0_us` |
 | Current-cycle samples table | `sample` | full `sample_t` |
@@ -225,6 +225,23 @@ Acceptance accepts unit suffixes (`10u`, `1u`, `100n`, `1000p`). References must
 put τ in the clean window (`250 µs`…`20 ms`): use **10–100 µF on 100 Ω** and
 **1–10 µF on 1 kΩ**, ideally low-ESR film. `Show ADC table` / `Clear ADC cal`
 manage what is stored; the calibration persists in NVS.
+
+### Offline fit analysis (`host/fit_analysis.py`)
+
+The ADC τ estimator is a voltage-domain nonlinear least-squares fit that solves
+`V_inf` jointly with τ (see `src/main.c: rc_exp_fit` and `HANDOVER.md` §4). This
+script mirrors both the old log-linear fit and the new one in pure Python so the
+math can be checked without hardware:
+
+```bash
+python3 host/fit_analysis.py                 # synthetic self-test (bias vs. V_inf error)
+python3 host/fit_analysis.py --noise 3       # with 3 mV RMS ADC noise
+python3 host/fit_analysis.py --rec eswcap_recording.json --csv fit.csv
+```
+
+`--rec` reads a recording saved by the precision view's **Save JSON** button and
+prints, per stored curve, the old vs. new τ, the fitted `V_inf`, R², voltage RMSE
+and τ uncertainty.
 
 ## Firmware telemetry protocol
 

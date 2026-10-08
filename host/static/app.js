@@ -269,9 +269,13 @@ function onCurve(ev) {
   state.lastCurve = ev;
   const xs = pts.map((p) => p[0]);
   const ys = pts.map((p) => p[1]);
+  // Ghost fit uses the same model the firmware fits:
+  //   V(t) = Vinf − (Vinf − V0)·exp(−(t − t0)/τ)
+  const v0 = (typeof ev.v0 === "number" && ev.v0 > 0) ? ev.v0 : 0;
+  const t0 = (typeof ev.t0_us === "number") ? ev.t0_us : 0;
   let fit = [];
   if (ev.tau_us > 0 && ev.vinf > 0) {
-    fit = xs.map((t) => ev.vinf * (1 - Math.exp(-t / ev.tau_us)));
+    fit = xs.map((t) => Math.max(0, ev.vinf - (ev.vinf - v0) * Math.exp(-(t - t0) / ev.tau_us)));
   } else {
     fit = xs.map(() => null);
   }
@@ -757,6 +761,17 @@ function updateFe(ev) {
   document.getElementById("bitSSR13").classList.toggle("on", !!ev.ssr13);
   document.getElementById("bitSSR2").classList.toggle("on", !!ev.ssr2);
   document.getElementById("bitDrive").classList.toggle("on", !!ev.drive);
+
+  // Persistent charge state: all SSRs off does NOT mean discharged (R_bias holds
+  // the DUT at bias), so this keeps reporting "charged" after a stop.
+  const bc = document.getElementById("bitCharge");
+  if (bc) {
+    const charge = ev.charge || (ev.charged && !ev.discharged ? "charged"
+                  : (ev.discharged && !ev.charged ? "discharged" : "unknown"));
+    bc.textContent = "CHARGE: " + charge.toUpperCase();
+    bc.className = "bit" + (charge === "charged" ? " charged"
+                           : charge === "discharged" ? " discharged" : "");
+  }
 
   const warn = document.getElementById("feWarn");
   if (ev.state === "precharged" || (ev.state === "idle" && ev.charged)) {

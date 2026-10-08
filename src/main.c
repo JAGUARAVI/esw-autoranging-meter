@@ -89,6 +89,12 @@ static inline int64_t atomic_read_i64(volatile int64_t *p)
 // entirely — the oscillator owns sub-nF.
 #define ADC_STEP_THRESHOLD_US 250
 
+// Per-sample ADC oversampling on the slow (high-R) ranges.  These ranges have a
+// long τ, so averaging a few conversions per stored point costs little time but
+// materially reduces ADC white noise and improves the τ fit.  Fast ranges use a
+// single reading (extra conversions would smear a short τ).
+#define ADC_POINT_AVG 4
+
 // Minimum usable asymptote.  Below this the divider droop is so severe that a
 // reliable τ crossing cannot be timed on this range.
 #define V_INF_MIN_MV 900
@@ -181,6 +187,9 @@ typedef struct {
     double quality;     // 0..1, physics-based confidence
     double tau_us;      // ADC: measured τ.   OSC: measured full period.
     double fit_r2;      // ADC: R² of the exponential fit (1 = perfect)
+    double fit_rmse_mv; // ADC: voltage-domain RMS residual of the fit (mV)
+    double tau_unc_us;  // ADC: 1-sigma standard error of τ (us; <0 = unknown)
+    double v_inf_mv;    // ADC: asymptote used/fitted for this sample (mV)
     double freq_hz;     // OSC only
     bool suspicious;    // timing/health looks wrong (down-weighted, still usable)
 } sample_t;
@@ -555,6 +564,9 @@ static volatile uint32_t osc_last_edge_us = 0;   // ISR rate-limit timestamp
 static void osc_loop_start(void)
 {
     osc_last_edge_us = 0;
+    // Re-arm the edge interrupt (the ISR disables it whenever the loop is off so
+    // a comparator that keeps toggling cannot load the CPU with no-op ISRs).
+    gpio_intr_enable(LM393_OUT_PIN);
     osc_running = true;
     gpio_set_level(DRIVE_PIN, (uint32_t)gpio_get_level(LM393_OUT_PIN));
 }
@@ -562,13 +574,16 @@ static void osc_loop_start(void)
 static void IRAM_ATTR lm393_isr_handler(void *arg)
 {
     (void)arg;
-    if (!osc_running) return;
+    if (!osc_running) return;   // loop off; cheap early-out
 
     // Rate limit: too many edges/sec -> stop before the CPU is overwhelmed.
+    // Disabling the edge interrupt here (while measuring, cache enabled) stops a
+    // self-sustained comparator from flooding this ISR after the DUT is unplugged.
     uint32_t now32 = (uint32_t)esp_timer_get_time();
     if (osc_last_edge_us != 0 &&
         (uint32_t)(now32 - osc_last_edge_us) < OSC_MIN_EDGE_INTERVAL_US) {
         osc_running = false;
+        gpio_intr_disable(LM393_OUT_PIN);
         gpio_set_level(DRIVE_PIN, 0);
         return;
     }
@@ -770,10 +785,15 @@ static void front_end_finish(void)
         front_end_discharge();
         g_fe_charged = false;
         g_fe_discharged = true;
+        fe_set(FE_IDLE);                 // bled to GND: safe
     } else {
-        front_end_idle();
+        front_end_idle();                // all SSRs off...
+        // ...but with SSR2 off the node is only isolated, NOT bled: the DUT and
+        // C_block stay at V_BIAS through R_bias.  Report that persistent charged
+        // state (FE_PRECHARGED) instead of a safe-looking IDLE, so the UI keeps
+        // warning and the status LED stays red until an explicit discharge.
+        fe_set(g_fe_charged ? FE_PRECHARGED : FE_IDLE);
     }
-    fe_set(FE_IDLE);
 }
 
 // ---------------------------------------------------------------------------
@@ -818,7 +838,9 @@ static volatile uint8_t    s_led_man_r = 0, s_led_man_g = 0, s_led_man_b = 0;
 static volatile int        s_led_flash = -1;          // -1 none, 0 good, 1 warn, 2 bad
 static volatile int64_t    s_led_flash_until_us = 0;
 static volatile bool       s_led_tx_done = true;      // previous frame finished
-static volatile int64_t    s_led_tx_start_us = 0;
+// Static (not stack) so a transaction the RMT engine is still clocking out can
+// never reference a stale stack frame.
+static rmt_symbol_word_t   s_led_sym[25];
 
 // RMT TX-done callback (IRAM).  We deliberately do NOT block on
 // rmt_tx_wait_all_done(): during an oscillator measurement the LM393 edge ISR
@@ -836,26 +858,23 @@ static bool IRAM_ATTR led_tx_done_cb(rmt_channel_handle_t ch,
 static void led_send(uint8_t r, uint8_t g, uint8_t b)
 {
     if (!s_led_ready) return;
-    if (!s_led_tx_done) {
-        // Still in flight.  If it has been stuck for >250 ms (e.g. the done IRQ
-        // was lost during a long ISR storm), force a retry rather than freeze.
-        if (esp_timer_get_time() - s_led_tx_start_us < 250000) return;
-        s_led_tx_done = true;
-    }
-    rmt_symbol_word_t sym[25];
+    // Only ever one frame in flight: if the previous frame has not completed we
+    // simply hold the last colour.  Never queue a second transaction (overlapping
+    // transactions are what wedged the RMT engine before).
+    if (!s_led_tx_done) return;
+
     uint32_t grb = ((uint32_t)g << 16) | ((uint32_t)r << 8) | (uint32_t)b;  // WS2812 GRB
     for (int i = 0; i < 24; ++i) {
         int bit = (grb >> (23 - i)) & 1;
-        sym[i].level0 = 1;
-        sym[i].duration0 = bit ? LED_T1H : LED_T0H;
-        sym[i].level1 = 0;
-        sym[i].duration1 = bit ? LED_T1L : LED_T0L;
+        s_led_sym[i].level0 = 1;
+        s_led_sym[i].duration0 = bit ? LED_T1H : LED_T0H;
+        s_led_sym[i].level1 = 0;
+        s_led_sym[i].duration1 = bit ? LED_T1L : LED_T0L;
     }
-    sym[24].level0 = 0; sym[24].duration0 = LED_RESET_TICKS;
-    sym[24].level1 = 0; sym[24].duration1 = 0;
+    s_led_sym[24].level0 = 0; s_led_sym[24].duration0 = LED_RESET_TICKS;
+    s_led_sym[24].level1 = 0; s_led_sym[24].duration1 = 0;
     rmt_transmit_config_t tx = { .loop_count = 0 };
-    s_led_tx_start_us = esp_timer_get_time();
-    if (rmt_transmit(s_led_chan, s_led_encoder, sym, sizeof(sym), &tx) == ESP_OK) {
+    if (rmt_transmit(s_led_chan, s_led_encoder, s_led_sym, sizeof(s_led_sym), &tx) == ESP_OK) {
         s_led_tx_done = false;
     }
 }
@@ -886,16 +905,55 @@ static void led_mode_rgb(led_mode_t m, int range, uint8_t *rgb)
     }
 }
 
+static bool status_led_rmt_init(void)
+{
+#if !STATUS_LED_ENABLE
+    return false;
+#else
+    rmt_tx_channel_config_t tx_cfg = {
+        .gpio_num = (gpio_num_t)STATUS_LED_GPIO,
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = LED_RMT_RES_HZ,
+        // 64 symbols -> 2 HW blocks -> 48-symbol ping-pong halves, so a 25-symbol
+        // WS2812 frame fits in a single half and needs no mid-frame threshold
+        // interrupt to complete (only the final TX-done event).
+        .mem_block_symbols = 64,
+        .trans_queue_depth = 1,   // one frame at a time; overlap wedges the engine
+        // Leave intr_priority = 0 (auto): forcing a high RMT interrupt preempted
+        // the FreeRTOS tick and starved IDLE0 -> task WDT.
+    };
+    if (rmt_new_tx_channel(&tx_cfg, &s_led_chan) != ESP_OK) return false;
+    rmt_tx_event_callbacks_t cbs = { .on_trans_done = led_tx_done_cb };
+    rmt_tx_register_event_callbacks(s_led_chan, &cbs, NULL);
+    rmt_copy_encoder_config_t enc_cfg;   // empty on this IDF (no config fields)
+    if (rmt_new_copy_encoder(&enc_cfg, &s_led_encoder) != ESP_OK) return false;
+    if (rmt_enable(s_led_chan) != ESP_OK) return false;
+    return true;
+#endif
+}
+
 static void status_led_task(void *arg)
 {
     (void)arg;
-    // Boot flourish: R -> G -> B, then hand over to the live state machine.
-    if (s_led_ready) {
-        led_send(180, 0, 0);   vTaskDelay(pdMS_TO_TICKS(140));
-        led_send(0, 180, 0);   vTaskDelay(pdMS_TO_TICKS(140));
-        led_send(0, 0, 180);   vTaskDelay(pdMS_TO_TICKS(140));
-        led_send(0, 0, 0);     vTaskDelay(pdMS_TO_TICKS(140));
+    // Bring RMT up from THIS task so its interrupt is allocated on this core
+    // (CPU1).  Keeping the LED task and its ISR entirely off CPU0 means the
+    // status LED can never starve the measurement task, the FreeRTOS tick or
+    // IDLE0 — the cause of the task-watchdog reset on CPU 0.
+    if (!status_led_rmt_init()) {
+        ESP_LOGW(TAG, "status LED: init failed (LED disabled)");
+        vTaskDelete(NULL);
+        return;
     }
+    s_led_ready = true;
+    ESP_LOGI(TAG, "status LED ready (WS2812 on GPIO%d, core %d)",
+             STATUS_LED_GPIO, (int)xPortGetCoreID());
+
+    // Boot flourish: R -> G -> B, then hand over to the live state machine.
+    led_send(180, 0, 0);   vTaskDelay(pdMS_TO_TICKS(140));
+    led_send(0, 180, 0);   vTaskDelay(pdMS_TO_TICKS(140));
+    led_send(0, 0, 180);   vTaskDelay(pdMS_TO_TICKS(140));
+    led_send(0, 0, 0);     vTaskDelay(pdMS_TO_TICKS(140));
+
     for (;;) {
         if (!s_led_auto) {                       // manual override (console 'led')
             led_send(s_led_man_r, s_led_man_g, s_led_man_b);
@@ -935,42 +993,12 @@ static void status_led_task(void *arg)
     }
 }
 
-static void status_led_init(void)
+static void status_led_start(void)
 {
-#if !STATUS_LED_ENABLE
-    return;
-#else
-    rmt_tx_channel_config_t tx_cfg = {
-        .gpio_num = (gpio_num_t)STATUS_LED_GPIO,
-        .clk_src = RMT_CLK_SRC_DEFAULT,
-        .resolution_hz = LED_RMT_RES_HZ,
-        // 64 symbols -> 2 HW blocks -> 48-symbol ping-pong halves, so a 25-symbol
-        // WS2812 frame fits in a single half and needs no mid-frame threshold
-        // interrupt to complete (only the final TX-done event).
-        .mem_block_symbols = 64,
-        .trans_queue_depth = 2,
-        // Higher (low/medium) interrupt priority than the LM393 GPIO edge ISR,
-        // so a fast oscillator cannot starve RMT completion.
-        .intr_priority = 3,
-    };
-    if (rmt_new_tx_channel(&tx_cfg, &s_led_chan) != ESP_OK) {
-        ESP_LOGW(TAG, "status LED: RMT channel init failed (LED disabled)");
-        return;
-    }
-    rmt_tx_event_callbacks_t cbs = { .on_trans_done = led_tx_done_cb };
-    rmt_tx_register_event_callbacks(s_led_chan, &cbs, NULL);
-    rmt_copy_encoder_config_t enc_cfg;   // empty on this IDF (no config fields)
-    if (rmt_new_copy_encoder(&enc_cfg, &s_led_encoder) != ESP_OK) {
-        ESP_LOGW(TAG, "status LED: encoder init failed (LED disabled)");
-        return;
-    }
-    if (rmt_enable(s_led_chan) != ESP_OK) {
-        ESP_LOGW(TAG, "status LED: RMT enable failed (LED disabled)");
-        return;
-    }
-    s_led_ready = true;
-    xTaskCreate(status_led_task, "status_led", 3072, NULL, 2, NULL);
-    ESP_LOGI(TAG, "status LED ready (WS2812 on GPIO%d)", STATUS_LED_GPIO);
+#if STATUS_LED_ENABLE
+    // Pinned to core 1, low priority: the LED (task + RMT ISR) must never
+    // compete with the measurement loop on core 0.
+    xTaskCreatePinnedToCore(status_led_task, "status_led", 4096, NULL, 1, NULL, 1);
 #endif
 }
 
@@ -978,7 +1006,11 @@ static void status_led_init(void)
 static void status_led_set_fe(fe_state_t s)
 {
     switch (s) {
-        case FE_IDLE:       s_led_mode = LED_MODE_IDLE;      break;
+        // Even "idle" is red if the node is still charged: all SSRs off does not
+        // mean discharged (R_bias holds the DUT at bias).  This keeps the LED
+        // red after a stop when auto-discharge is OFF.
+        case FE_IDLE:       s_led_mode = (g_fe_charged && !g_fe_discharged)
+                                             ? LED_MODE_BIASED : LED_MODE_IDLE; break;
         case FE_PRECHARGE:  s_led_mode = LED_MODE_PRECHARGE; break;
         case FE_PRECHARGED: s_led_mode = LED_MODE_BIASED;    break;
         case FE_MEASURING:  s_led_mode = LED_MODE_MEASURING; break;
@@ -1070,7 +1102,7 @@ static void system_hw_init(void)
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_config, &adc_handle));
 
     adc_oneshot_chan_cfg_t channel_config = {
-        .bitwidth = ADC_BITWIDTH_DEFAULT,
+        .bitwidth = ADC_BITWIDTH_12,
         .atten = ADC_ATTEN_DB_12,
     };
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CHANNEL, &channel_config));
@@ -1091,7 +1123,7 @@ static void system_hw_init(void)
     ESP_LOGW(TAG, "ADC calibration scheme not supported by this build");
 #endif
 
-    status_led_init();
+    status_led_start();
 }
 
 // Recover the true DUT capacitance from the measured series-equivalent.
@@ -1181,15 +1213,17 @@ static void evt_sample(const sample_t *s)
 {
     if (!g_stream) return;
     double vinf = (s->method == METHOD_ADC_STEP)
-                      ? (double)g_v_inf_cache[s->range_idx] : -1.0;
+                      ? (s->v_inf_mv > 0.0 ? s->v_inf_mv
+                                           : (double)g_v_inf_cache[s->range_idx]) : -1.0;
     printf("@@EVT {\"t\":\"sample\",\"phase\":\"%s\",\"method\":\"%s\",\"range\":%d,"
            "\"label\":\"%s\",\"valid\":%s,\"plausible\":%s,\"c\":%.9g,\"c_eq\":%.9g,"
-           "\"q\":%.6g,\"tau_us\":%.6g,\"freq\":%.6g,\"r2\":%.6g,\"vinf\":%.0f}\n",
+           "\"q\":%.6g,\"tau_us\":%.6g,\"freq\":%.6g,\"r2\":%.6g,\"vinf\":%.0f,"
+           "\"rmse_mv\":%.6g,\"tau_unc_us\":%.6g}\n",
            g_phase, s->method == METHOD_ADC_STEP ? "adc" : "osc",
            s->range_idx, RANGES[s->range_idx].label,
            s->valid ? "true" : "false", s->plausible ? "true" : "false",
            s->capacitance_f, s->c_eq_f, s->quality, s->tau_us, s->freq_hz,
-           s->fit_r2, vinf);
+           s->fit_r2, vinf, s->fit_rmse_mv, s->tau_unc_us);
 }
 
 // Fusion breakdown: exactly which (range, method) samples entered the fusion,
@@ -1250,12 +1284,14 @@ static void evt_stat(void)
            (unsigned)esp_get_minimum_free_heap_size());
 }
 
-static void evt_curve(uint8_t range_idx, int vinf, double tau_us, double r2,
+static void evt_curve(uint8_t range_idx, int vinf, int v0, double t0_us,
+                      double tau_us, double r2,
                       const int64_t *ts, const int *mv, int n)
 {
     if (!g_stream || !g_stream_curve) return;
-    printf("@@EVT {\"t\":\"curve\",\"range\":%d,\"vinf\":%d,\"tau_us\":%.6g,"
-           "\"r2\":%.6g,\"pts\":[", range_idx, vinf, tau_us, r2);
+    printf("@@EVT {\"t\":\"curve\",\"range\":%d,\"vinf\":%d,\"v0\":%d,\"t0_us\":%.6g,"
+           "\"tau_us\":%.6g,\"r2\":%.6g,\"pts\":[",
+           range_idx, vinf, v0, t0_us, tau_us, r2);
     for (int i = 0; i < n; ++i)
         printf("%s[%lld,%d]", i ? "," : "", (long long)(ts[i] - ts[0]), mv[i]);
     printf("]}\n");
@@ -1325,11 +1361,23 @@ static const char *fe_name(fe_state_t s)
     }
 }
 
+// Persistent node charge state, independent of the momentary SSR/phase state:
+//   "charged"    N_DUT/C_block are held at V_BIAS (through R_bias) — not safe to touch
+//   "discharged" bled to GND since the last charge
+//   "unknown"    never charged nor discharged since boot
+// This is what survives a stop: with auto-discharge OFF the node stays charged.
+static const char *fe_charge_state(void)
+{
+    if (g_fe_charged && !g_fe_discharged) return "charged";
+    if (g_fe_discharged && !g_fe_charged) return "discharged";
+    return "unknown";
+}
+
 static void evt_fe(void)
 {
     if (!g_stream) return;
     printf("@@EVT {\"t\":\"fe\",\"state\":\"%s\",\"ssr13\":%d,\"ssr2\":%d,\"drive\":%d,"
-           "\"biased\":%s,\"charged\":%s,\"discharged\":%s,"
+           "\"biased\":%s,\"charged\":%s,\"discharged\":%s,\"charge\":\"%s\","
            "\"auto_pre\":%s,\"auto_dis\":%s,"
            "\"run\":%s,\"single\":%s,\"lock\":%d}\n",
            fe_name(g_fe_state),
@@ -1338,6 +1386,7 @@ static void evt_fe(void)
            g_fe_state == FE_PRECHARGED ? "true" : "false",
            g_fe_charged ? "true" : "false",
            g_fe_discharged ? "true" : "false",
+           fe_charge_state(),
            g_auto_precharge ? "true" : "false",
            g_auto_discharge ? "true" : "false",
            g_run ? "true" : "false",
@@ -1407,68 +1456,250 @@ static void invalidate_vinf_cache(void)
     for (int i = 0; i < RANGE_COUNT; ++i) g_v_inf_cache[i] = 0;
 }
 
-// --- Least-squares exponential fit of the RC charge curve -----------------
-// The charge follows V(t) = V_inf·(1 − e^(−t/τ)), so
-//      ln(V_inf − V) = ln(V_inf) − t/τ
-// is a straight line in t with slope −1/τ.  We fit that line over all sampled
-// points; the slope gives τ and R² tells us how exponential the curve really
-// is (leakage, ESR, or dielectric absorption bend the curve → lower R²).
-#define RC_FIT_MAX_PTS 48
+// --- Nonlinear least-squares fit of the RC charge curve -------------------
+// The charge follows  V(t) = V_inf − (V_inf − V0)·e^(−(t−t0)/τ).
+//
+// The previous estimator linearised this to  ln(V_inf − V) = ln(V_inf) − t/τ
+// and fitted a straight line by ordinary least squares.  That has two accuracy
+// problems:
+//   1. It assumes the asymptote V_inf is known exactly, but V_inf comes from a
+//      coarse settle measurement.  τ is very sensitive to a V_inf error.
+//   2. The log transform re-weights the ADC noise (early points compressed,
+//      points near the asymptote blown up), so OLS in log space is not the
+//      maximum-likelihood estimator for additive voltage noise.
+//
+// This version fits the curve in the *voltage* domain and solves V_inf jointly
+// with τ (and the effective origin t0) using a damped Gauss–Newton
+// (Levenberg–Marquardt) iteration with an analytic Jacobian.  V0 is taken from
+// the measured pre-step node voltage.  Working arrays live in static storage
+// (single measurement task) to keep them off the limited main-task stack.
+#define RC_FIT_MAX_PTS   64   // capture + fit capacity
+#define RC_FIT_MIN_PTS   8    // minimum points for a meaningful fit
+#define RC_FIT_MAX_ITER  50
+#define RC_FIT_GLITCH_MV 40   // reject a sample this far below the running max
 
 typedef struct {
-    bool ok;
-    double tau_us;   // fitted time constant
-    double r2;       // coefficient of determination (1 = perfect exponential)
-    int n;           // points used
+    bool   ok;
+    double tau_us;    // fitted time constant (us)
+    double v_inf_mv;  // fitted asymptote (mV)
+    double t0_us;     // fitted origin, relative to ts[0] (us, normally < 0)
+    double r2;        // log-domain R² (quality semantics, as before)
+    double rmse_mv;   // voltage-domain RMS residual (mV)
+    double tau_se_us; // 1-sigma standard error of τ (us; 0 if not estimated)
+    int    n;         // points used
 } rc_fit_t;
 
-// ts[] = time in us, mv[] = calibrated millivolts, n = count, v_inf = asymptote.
-static rc_fit_t rc_exp_fit(const int64_t *ts, const int *mv, int n, int v_inf)
+// Solve the 3x3 system A·x = b by Gauss–Jordan elimination with partial
+// pivoting.  Returns false if the matrix is (numerically) singular.
+static bool rc_solve3(double A[3][3], const double b[3], double x[3])
 {
-    rc_fit_t r = {.ok = false, .tau_us = 0.0, .r2 = 0.0, .n = 0};
-    if (n < 6 || v_inf <= 0) return r;
+    double M[3][4];
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) M[i][j] = A[i][j];
+        M[i][3] = b[i];
+    }
+    for (int col = 0; col < 3; ++col) {
+        int piv = col;
+        for (int rr = col + 1; rr < 3; ++rr)
+            if (fabs(M[rr][col]) > fabs(M[piv][col])) piv = rr;
+        if (fabs(M[piv][col]) < 1e-12) return false;
+        if (piv != col)
+            for (int j = col; j < 4; ++j) {
+                double t = M[col][j]; M[col][j] = M[piv][j]; M[piv][j] = t;
+            }
+        double d = M[col][col];
+        for (int j = col; j < 4; ++j) M[col][j] /= d;
+        for (int rr = 0; rr < 3; ++rr) {
+            if (rr == col) continue;
+            double f = M[rr][col];
+            if (f == 0.0) continue;
+            for (int j = col; j < 4; ++j) M[rr][j] -= f * M[col][j];
+        }
+    }
+    for (int i = 0; i < 3; ++i) x[i] = M[i][3];
+    return true;
+}
 
-    // Build y = ln(V_inf - V) and drop points too close to the asymptote where
-    // (V_inf - V) approaches the ADC noise floor and the log blows up.
-    // Working arrays live in static storage (single measurement task => safe)
-    // to keep them off the main task's limited stack.
+// Model value at a point x (us, relative to ts[0]).
+static inline double rc_model(double x, double v_inf, double tau, double t0, double v0)
+{
+    return v_inf - (v_inf - v0) * exp(-(x - t0) / tau);
+}
+
+// ts[] = absolute time (us, ts[0] = fit origin), mv[] = calibrated mV,
+// n = count, v_inf_hint = measured asymptote (mV; 0 = unknown),
+// v0_mv = measured node voltage at the step edge (mV),
+// t0_hint_us = drive-edge time relative to ts[0] (us; normally negative).
+static rc_fit_t rc_exp_fit(const int64_t *ts, const int *mv, int n,
+                           int v_inf_hint, int v0_mv, double t0_hint_us)
+{
+    rc_fit_t r = {0};
+    r.r2 = 0.0;
+    if (n < RC_FIT_MIN_PTS || v0_mv < 0) return r;
+
+    // Build the working set with a monotonic glitch filter so one ADC spike
+    // cannot bias the fit.
     static double xs[RC_FIT_MAX_PTS], ys[RC_FIT_MAX_PTS];
-    double sx = 0, sy = 0, sxx = 0, sxy = 0;
-    int m = 0;
-    for (int i = 0; i < n; ++i) {
-        double gap = (double)v_inf - (double)mv[i];
-        if (gap < 12.0) continue;              // too close to asymptote / noise
-        double x = (double)(ts[i] - ts[0]);     // us, relative to first sample
-        double y = log(gap);
-        xs[m] = x; ys[m] = y;
-        sx += x; sy += y; sxx += x * x; sxy += x * y;
+    int m = 0, run_max = mv[0];
+    for (int i = 0; i < n && m < RC_FIT_MAX_PTS; ++i) {
+        if (mv[i] > run_max) run_max = mv[i];
+        if (mv[i] < run_max - RC_FIT_GLITCH_MV) continue;   // downward glitch
+        xs[m] = (double)(ts[i] - ts[0]);
+        ys[m] = (double)mv[i];
         m++;
-        if (m >= RC_FIT_MAX_PTS) break;
     }
-    if (m < 6) return r;
+    if (m < RC_FIT_MIN_PTS) return r;
 
-    double denom = (double)m * sxx - sx * sx;
-    if (fabs(denom) < 1e-9) return r;
-    double slope = ((double)m * sxy - sx * sy) / denom;   // = -1/τ (per us)
-    if (slope >= -1e-9) return r;                          // not decaying → bad
-    double tau_us = -1.0 / slope;
+    double y_max = ys[0];
+    for (int i = 1; i < m; ++i) if (ys[i] > y_max) y_max = ys[i];
 
-    // R² of the linear fit in log space.
-    double ybar = sy / (double)m;
-    double ss_res = 0, ss_tot = 0;
-    double intercept = (sy - slope * sx) / (double)m;
+    // ---- Initial parameters -------------------------------------------------
+    double v_inf = (v_inf_hint > 0) ? (double)v_inf_hint : (y_max + 200.0);
+    if (v_inf < y_max + 2.0) v_inf = y_max + 200.0;   // hint must exceed data
+    double t0 = (t0_hint_us < 0.0) ? t0_hint_us : 0.0;
+    // Seed τ from the model-free 63.2 % crossing.
+    double v63 = (double)v0_mv + 0.632 * (v_inf - (double)v0_mv);
+    double tau = 0.0;
+    for (int i = 0; i < m; ++i)
+        if (ys[i] >= v63) { tau = xs[i] - t0; break; }
+    if (tau <= 0.0) tau = (xs[m - 1] - t0) * 0.4;
+    if (tau <= 1e-3) tau = 1.0;
+
+    // ---- Damped Gauss–Newton (Levenberg–Marquardt) --------------------------
+    // cost(p) = Σ (model(x_i; p) − y_i)²
+    double cost = 0.0;
     for (int i = 0; i < m; ++i) {
-        double yhat = slope * xs[i] + intercept;
-        double dres = ys[i] - yhat;
-        double dtot = ys[i] - ybar;
-        ss_res += dres * dres;
-        ss_tot += dtot * dtot;
+        double res = rc_model(xs[i], v_inf, tau, t0, (double)v0_mv) - ys[i];
+        cost += res * res;
     }
-    double r2 = (ss_tot > 1e-12) ? (1.0 - ss_res / ss_tot) : 0.0;
+
+    double lambda = 1e-2;
+    bool converged = false;
+    for (int it = 0; it < RC_FIT_MAX_ITER && !converged; ++it) {
+        double amp = v_inf - (double)v0_mv;
+        if (amp <= 0.0) break;
+
+        double A[3][3] = {{0}}, g[3] = {0};
+        for (int i = 0; i < m; ++i) {
+            double s = (xs[i] - t0) / tau;
+            if (s < -20.0) s = -20.0;
+            double e = exp(-s);
+            double res = (v_inf - amp * e) - ys[i];
+            double J[3];
+            J[0] = 1.0 - e;                                   // d/dV_inf
+            J[1] = -amp * e * (xs[i] - t0) / (tau * tau);      // d/dtau
+            J[2] = -amp * e / tau;                             // d/dt0
+            for (int a = 0; a < 3; ++a) {
+                g[a] += J[a] * res;
+                for (int b2 = 0; b2 < 3; ++b2) A[a][b2] += J[a] * J[b2];
+            }
+        }
+        // LM damping on the diagonal.
+        double Ad[3][3];
+        for (int a = 0; a < 3; ++a)
+            for (int b2 = 0; b2 < 3; ++b2) Ad[a][b2] = A[a][b2];
+        for (int a = 0; a < 3; ++a)
+            Ad[a][a] += lambda * (A[a][a] > 0.0 ? A[a][a] : 1.0);
+
+        double delta[3];
+        if (!rc_solve3(Ad, g, delta)) { lambda *= 10.0; if (lambda > 1e12) break; continue; }
+
+        double nv = v_inf - delta[0];
+        double nt = tau   - delta[1];
+        double n0 = t0    - delta[2];
+        // Keep parameters physical.
+        if (nt < 1e-3) nt = 1e-3;
+        if (nv <= (double)v0_mv) nv = (double)v0_mv + 1.0;
+        if (nv > 1.2 * V_NOMINAL_MV) nv = 1.2 * V_NOMINAL_MV;
+        if (n0 > 0.0) n0 = 0.0;
+
+        double trial = 0.0;
+        for (int i = 0; i < m; ++i) {
+            double res = rc_model(xs[i], nv, nt, n0, (double)v0_mv) - ys[i];
+            trial += res * res;
+        }
+
+        if (trial < cost) {
+            double dtau = fabs(nt - tau), dvinf = fabs(nv - v_inf);
+            v_inf = nv; tau = nt; t0 = n0;
+            cost = trial;
+            lambda *= 0.5;
+            if (lambda < 1e-9) lambda = 1e-9;
+            if (dtau < 1e-6 * tau && dvinf < 1e-6 * v_inf) converged = true;
+        } else {
+            lambda *= 4.0;
+            if (lambda > 1e12) break;
+        }
+    }
+
+    if (!(tau > 0.0) || !(v_inf > (double)v0_mv)) return r;
+
+    // ---- Goodness of fit ----------------------------------------------------
+    double rmse = sqrt(cost / (double)m);
+
+    // Log-domain R² (against the *fitted* asymptote) preserves the quality
+    // semantics the fusion scoring was tuned on, while τ itself comes from the
+    // superior voltage-domain fit.
+    double sx = 0, sy = 0, sxx = 0, sxy = 0;
+    int k = 0;
+    for (int i = 0; i < m; ++i) {
+        double gap = v_inf - ys[i];
+        if (gap < 12.0) continue;
+        double y = log(gap);
+        sx += xs[i]; sy += y; sxx += xs[i] * xs[i]; sxy += xs[i] * y;
+        k++;
+    }
+    double r2 = 0.0;
+    if (k >= 4) {
+        double denom = (double)k * sxx - sx * sx;
+        if (fabs(denom) > 1e-9) {
+            double slope = ((double)k * sxy - sx * sy) / denom;
+            double intercept = (sy - slope * sx) / (double)k;
+            double ybar = sy / (double)k;
+            double ss_res = 0, ss_tot = 0;
+            for (int i = 0; i < m; ++i) {
+                double gap = v_inf - ys[i];
+                if (gap < 12.0) continue;
+                double y = log(gap);
+                double yhat = slope * xs[i] + intercept;
+                ss_res += (y - yhat) * (y - yhat);
+                ss_tot += (y - ybar) * (y - ybar);
+            }
+            r2 = (ss_tot > 1e-12) ? (1.0 - ss_res / ss_tot) : 0.0;
+        }
+    }
+
+    // τ standard error from the covariance σ²·(JᵀJ)⁻¹.
+    double tau_se = 0.0;
+    if (m > 3) {
+        double A[3][3] = {{0}};
+        double amp2 = v_inf - (double)v0_mv;
+        for (int i = 0; i < m; ++i) {
+            double s = (xs[i] - t0) / tau;
+            if (s < -20.0) s = -20.0;
+            double e = exp(-s);
+            double J[3];
+            J[0] = 1.0 - e;
+            J[1] = -amp2 * e * (xs[i] - t0) / (tau * tau);
+            J[2] = -amp2 * e / tau;
+            for (int a = 0; a < 3; ++a)
+                for (int b2 = 0; b2 < 3; ++b2) A[a][b2] += J[a] * J[b2];
+        }
+        double sigma2 = cost / (double)(m - 3);
+        double e1[3] = {0, 1, 0}, col[3];
+        if (rc_solve3(A, e1, col)) {
+            double var = sigma2 * col[1];
+            if (var > 0.0) tau_se = sqrt(var);
+        }
+    }
 
     r.ok = true;
-    r.tau_us = tau_us;
+    r.tau_us = tau;
+    r.v_inf_mv = v_inf;
+    r.t0_us = t0;
     r.r2 = r2;
+    r.rmse_mv = rmse;
+    r.tau_se_us = tau_se;
     r.n = m;
     return r;
 }
@@ -1558,21 +1789,26 @@ static sample_t measure_adc_range(uint8_t range_idx)
         return s;
     }
 
-    // ---- Phase B: capture the charge curve, then least-squares fit τ ----
-    // We sample the node from just above the start floor up to ~70 % of V_inf
-    // (past the 63.2 % τ point), then fit ln(V_inf - V) vs t.  The slope is
-    // -1/τ; the R² of the fit is a direct quality/leakage metric.  If the fit
-    // is unusable we fall back to the classic two-threshold crossing time.
+    // ---- Phase B: capture the charge curve, then fit τ ----
+    // We sample from just above the start floor up to ~90 % of V_inf (well past
+    // the 63.2 % τ point) and fit V(t) = V_inf − (V_inf − V0)·e^(−(t−t0)/τ) in
+    // the voltage domain, solving V_inf and τ *jointly* (see rc_exp_fit).  If
+    // the fit is unusable we fall back to the classic two-threshold crossing.
     int v_low = v_start + (int)(0.10 * (double)(v_inf - v_start));
     if (v_low < v_start + 40) v_low = v_start + 40;
     int v_tau = v_start + (int)(V_TAU_FRAC * (double)(v_inf - v_start));
-    int v_stop = v_start + (int)(0.72 * (double)(v_inf - v_start)); // capture past τ
+    int v_stop = v_start + (int)(0.90 * (double)(v_inf - v_start)); // deep into tail
 
     // Sample buffers in static storage (single measurement task => safe) to
     // avoid overflowing the main task stack (the default is only ~3.5 KB).
     static int64_t ts[RC_FIT_MAX_PTS];
     static int     mvs[RC_FIT_MAX_PTS];
     int     npts = 0;
+
+    // Capture the node voltage at the step edge as the fit's V0.  The node is
+    // held low and stable here, so this is the best estimate of the start level.
+    int v0_step = adc_read_avg_mv(5);
+    if (v0_step < 0) v0_step = v_start;
 
     int64_t t_begin = esp_timer_get_time();
     gpio_set_level(DRIVE_PIN, 1);
@@ -1589,10 +1825,22 @@ static sample_t measure_adc_range(uint8_t range_idx)
         }
         int mv;
         int64_t t_before = esp_timer_get_time();
-        if (!read_vcap_mv(&mv)) {
+        // Oversample on the slow (high-R) ranges where the time budget is
+        // ample: averaging converts ADC white noise into a cleaner curve, which
+        // sharpens the τ fit.  The fast ranges keep single reads so the extra
+        // conversions cannot smear a short τ.
+        int navg = (range_idx >= 2) ? ADC_POINT_AVG : 1;
+        long acc = 0;
+        int  got = 0;
+        for (int a = 0; a < navg; ++a) {
+            int v;
+            if (read_vcap_mv(&v)) { acc += v; got++; }
+        }
+        if (got == 0) {
             gpio_set_level(DRIVE_PIN, 0);
             return s;
         }
+        mv = (int)(acc / got);
         int64_t now = (t_before + esp_timer_get_time()) / 2;
 
         if ((now - t_last_feed) > 500000LL) {
@@ -1620,26 +1868,29 @@ static sample_t measure_adc_range(uint8_t range_idx)
     // the 100 Ω / 1 kΩ ranges.  When calibrated, use the measured effective
     // resistance; otherwise fall back to nominal.  Fold in the parallel leakage
     // path implied by the measured asymptote droop.
-    double r_range = RANGES[range_idx].resistance_ohms;
-    double r_chain = adc_cal_valid(range_idx) ? adc_r_eff(range_idx) : r_range;
-    if (r_chain <= 0.0) r_chain = r_range;
-    double r_leak = ((double)v_inf * r_chain) / ((double)V_NOMINAL_MV - (double)v_inf + 1e-9);
-    double r_eff = r_chain;
-    if (v_inf < V_NOMINAL_MV - 50 && r_leak > 0.0) {
-        r_eff = (r_chain * r_leak) / (r_chain + r_leak); // parallel
-    }
-
     double tau_us = -1.0;
     double fit_r2 = 0.0;
+    double fit_rmse = -1.0;
+    double tau_unc = -1.0;
     bool used_fit = false;
     double fallback_k_corr = 1.0;   // log factor for the 2-point fallback
 
-    // Primary: least-squares exponential fit over the captured curve.
-    rc_fit_t fit = rc_exp_fit(ts, mvs, npts, v_inf);
+    // Primary: nonlinear least-squares fit of the captured curve.  t0 is the
+    // drive-edge time relative to the first stored sample (normally negative);
+    // V0 is the node voltage measured just before the step.
+    double t0_hint = (npts > 0) ? (double)(t_begin - ts[0]) : 0.0;
+    rc_fit_t fit = rc_exp_fit(ts, mvs, npts, v_inf, v0_step, t0_hint);
     if (fit.ok && fit.r2 > 0.90 && fit.tau_us > 0.0) {
         tau_us = fit.tau_us;
         fit_r2 = fit.r2;
+        fit_rmse = fit.rmse_mv;
+        tau_unc = fit.tau_se_us;
         used_fit = true;
+        // Feed the fitted asymptote back into the per-range cache: it is a
+        // better estimate than the coarse settle loop and sharpens the capture
+        // window (and the leakage-derived R_eff) on subsequent visits.
+        if (fit.v_inf_mv > V_INF_MIN_MV && fit.v_inf_mv <= V_NOMINAL_MV)
+            g_v_inf_cache[range_idx] = (int)(fit.v_inf_mv + 0.5);
     } else if (t_start >= 0 && t_tau > t_start) {
         // Fallback: two-threshold crossing time with the exact log correction.
         double denom = (double)(v_inf - v_tau);
@@ -1658,13 +1909,36 @@ static sample_t measure_adc_range(uint8_t range_idx)
     // calibration reuse this exact estimator.
     double tau_eff_us = used_fit ? tau_us : (tau_us / fallback_k_corr);
 
+    // Asymptote for the leakage/series-resistance model: prefer the fitted value
+    // (derived from the whole curve, not a settle snapshot).
+    double v_inf_eff = used_fit ? fit.v_inf_mv : (double)v_inf;
+
+    double r_range = RANGES[range_idx].resistance_ohms;
+    double r_chain = adc_cal_valid(range_idx) ? adc_r_eff(range_idx) : r_range;
+    if (r_chain <= 0.0) r_chain = r_range;
+    double r_leak = (v_inf_eff * r_chain) / ((double)V_NOMINAL_MV - v_inf_eff + 1e-9);
+    double r_eff = r_chain;
+    if (v_inf_eff < V_NOMINAL_MV - 50 && r_leak > 0.0) {
+        r_eff = (r_chain * r_leak) / (r_chain + r_leak); // parallel
+    }
+
     // Stream the captured charge curve + fitted exponential for the UI graph.
-    evt_curve(range_idx, v_inf, used_fit ? tau_us : -1.0,
-              used_fit ? fit_r2 : -1.0, ts, mvs, npts);
+    // Emit the *fitted* asymptote/origin (when available) so the host ghost
+    // line reproduces the same model.
+    evt_curve(range_idx,
+              used_fit ? (int)(fit.v_inf_mv + 0.5) : v_inf,
+              v0_step,
+              used_fit ? fit.t0_us : t0_hint,
+              used_fit ? tau_us : -1.0,
+              used_fit ? fit_r2 : -1.0,
+              ts, mvs, npts);
 
     s.valid = true;
     s.tau_us = tau_eff_us;
     s.fit_r2 = fit_r2;
+    s.fit_rmse_mv = fit_rmse;
+    s.tau_unc_us = tau_unc;
+    s.v_inf_mv = v_inf_eff;
 
     // Recover C_eq = τ_eff / R_eff.
     double c_eq = (tau_eff_us * 1e-6) / r_eff;
@@ -1715,7 +1989,16 @@ static sample_t measure_adc_range(uint8_t range_idx)
     else if (s.fit_r2 >= 0.99) q_fit = 1.0;                      // clean exponential
     else                       q_fit = 0.4 + 0.6 * s.fit_r2;     // scale by R²
 
-    double q = q_time * q_stray * q_range * q_fit;
+    // Fit uncertainty: τ standard error relative to τ.  A large relative error
+    // means the curve poorly constrains τ (noisy / too few points / leaky), so
+    // down-weight it.  1 % is the full-credit target; 5 % costs ~1/e.
+    double q_unc = 1.0;
+    if (used_fit && tau_unc > 0.0 && tau_eff_us > 0.0) {
+        double relu = tau_unc / tau_eff_us;
+        q_unc = exp(-pow(relu / 0.05, 2.0));
+    }
+
+    double q = q_time * q_stray * q_range * q_fit * q_unc;
     // No artificial quality floor: with the ADC hard-gated at
     // ADC_STEP_THRESHOLD_US, sub-floor/noisy samples never reach scoring, so a
     // low q here is genuine (leaky/non-exponential) and must be allowed to sink.

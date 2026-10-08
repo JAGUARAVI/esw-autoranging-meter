@@ -625,8 +625,11 @@ function renderCurve(rec) {
   const pts = ev.pts;
   const xs = pts.map((p) => p[0]);
   const ys = pts.map((p) => p[1]);
+  // Ghost fit mirrors the firmware model: V(t) = Vinf − (Vinf − V0)·exp(−(t−t0)/τ).
+  const v0 = (typeof ev.v0 === "number" && ev.v0 > 0) ? ev.v0 : 0;
+  const t0 = (typeof ev.t0_us === "number") ? ev.t0_us : 0;
   const fit = (ev.tau_us > 0 && ev.vinf > 0)
-    ? xs.map((t) => ev.vinf * (1 - Math.exp(-t / ev.tau_us)))
+    ? xs.map((t) => Math.max(0, ev.vinf - (ev.vinf - v0) * Math.exp(-(t - t0) / ev.tau_us)))
     : xs.map(() => null);
   curveU.setData([xs, ys, fit]);
   // include the faint history in the domains so nothing clips
@@ -877,6 +880,13 @@ function onFe(ev) {
   const rs = $("runState");
   rs.textContent = S.single ? "SINGLE" : (S.running ? "RUN" : "HOLD");
   rs.className = "chip run " + (S.running ? "on" : "hold");
+
+  // Persistent charge state (survives a stop).
+  const ch = $("chipCharge");
+  const charge = ev.charge || (ev.charged && !ev.discharged ? "charged"
+                : (ev.discharged && !ev.charged ? "discharged" : "unknown"));
+  ch.textContent = "CHARGE: " + charge.toUpperCase();
+  ch.className = "chip " + (charge === "charged" ? "bad" : charge === "discharged" ? "good" : "");
   const sel = $("mode");
   if (sel) sel.value = String(S.lock >= 0 ? S.lock : -1);
   const hd = $("btnSingle");
