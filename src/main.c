@@ -3127,16 +3127,22 @@ static void dbg_tare(int range_or_all)
         double r_ohm = RANGES[r].resistance_ohms;
         for (int kk = 0; kk < TARE_SAMPLES; ++kk) {
             // Same frequency path as the runtime measurement (500 ms reciprocal
-            // on 1 MΩ) so T0 subtracts the exact estimator the measurement uses.
+            // on 1 MΩ) so T0 subtracts the exact estimator the measurement uses,
+            // AND the same acceptance gates, so T0 is never derived from a
+            // reading the runtime would reject.
             double f = 0.0;
             uint32_t nper = 0;
-            if (osc_read_freq(&f, &nper) && f > 0.0) {
+            if (osc_read_freq(&f, &nper) && f > 0.0 &&
+                f >= OSC_MIN_F_HZ && f <= 1000000.0 && nper >= 4) {
                 acc += 1e6 / f;
                 got++;
-                // Live tare sample for the UI strip chart (running mean).
+                // Live tare sample for the UI strip chart (running mean).  The
+                // implied stray is reconstructed exactly like a measurement:
+                // run the open-node series-equivalent through cblock_invert.
                 double mean = acc / (double)got;
-                double stray = (k * r_ohm > 0.0)
-                                   ? (mean * 1e-6) / (k * r_ohm) * 1e12 : 0.0;
+                double ceq0 = (k * r_ohm > 0.0)
+                                  ? (mean * 1e-6) / (k * r_ohm) : 0.0;
+                double stray = (ceq0 > 0.0) ? cblock_invert(ceq0) * 1e12 : 0.0;
                 evt_tare(r, kk, TARE_SAMPLES, f, mean, stray, 0);
             }
             esp_task_wdt_reset();
@@ -3154,8 +3160,10 @@ static void dbg_tare(int range_or_all)
         g_osc_cal[r].t0_us = period;
         g_osc_cal[r].has_t0 = true;
         esp_err_t e = osc_cal_save();
-        double stray_pf = (k * r_ohm > 0.0)
-                              ? (period * 1e-6) / (k * r_ohm) * 1e12 : 0.0;
+        // Implied node parasitic C, reconstructed the same way a measurement
+        // does (series-equivalent → cblock_invert), not the raw T0/(K·R).
+        double ceq0 = (k * r_ohm > 0.0) ? (period * 1e-6) / (k * r_ohm) : 0.0;
+        double stray_pf = (ceq0 > 0.0) ? cblock_invert(ceq0) * 1e12 : 0.0;
         printf(">> %s TARE: T0 = %.2f us  (implied parasitic C = %.1f pF)  %s\n",
                RANGES[r].label, period, stray_pf,
                (e == ESP_OK) ? "saved to NVS" : "NVS SAVE FAILED");
